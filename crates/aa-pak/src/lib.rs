@@ -4,8 +4,9 @@
 //! every 0x150-byte file table entry are AES-128-CBC encrypted on their own with a zero IV and the
 //! XLGames key. File data is stored raw (no compression, no encryption).
 //!
-//! [`Pak::open`] also opens the compressed pak written by `aa-bake` (see [`baked`]); both behave
-//! the same through this API. In the browser (wasm32) the pak is a v2 baked pak fetched over HTTP:
+//! [`Pak::open`] also opens the compressed pak written by `aa-bake` (see [`baked`]), and an unpacked
+//! client directory (`AA_PAK` pointing at the folder holding `game/`); all behave the same through
+//! this API. In the browser (wasm32) the pak is a v2 baked pak fetched over HTTP:
 //! see [`web`], whose `open` must run before [`Pak::global`].
 //!
 //! Paths are matched case-insensitively with `/` or `\` separators. CryEngine paths are relative
@@ -62,6 +63,16 @@ fn overlay_file(path: &str) -> Option<PathBuf> {
     file.is_file().then_some(file)
 }
 
+/// The loose file standing in for `path` in an unpacked client directory.
+#[cfg(not(target_arch = "wasm32"))]
+fn loose_file<'a>(loose: &'a HashMap<String, PathBuf>, path: &str) -> io::Result<&'a PathBuf> {
+    let n = normalize(path);
+    loose
+        .get(&n)
+        .or_else(|| loose.get(&format!("game/{n}")))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("not in game_pak: {path}")))
+}
+
 /// Location of one file inside the pak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -93,6 +104,9 @@ pub struct Pak {
     blocks: Vec<baked::Block>,
     /// Recently decompressed blocks, newest last.
     cache: Mutex<Vec<(u32, Arc<Vec<u8>>)>>,
+    /// An unpacked client directory (`AA_PAK` points at a folder): normalised name -> file on disk.
+    #[cfg(not(target_arch = "wasm32"))]
+    loose: Option<HashMap<String, PathBuf>>,
 }
 
 /// Decompressed v2 blocks kept around (`AA_PAK_CACHE_MB`, default 256).
@@ -120,6 +134,10 @@ impl Pak {
 
     pub fn open(path: impl AsRef<Path>) -> io::Result<Pak> {
         let path = path.as_ref().to_path_buf();
+        #[cfg(not(target_arch = "wasm32"))]
+        if path.is_dir() {
+            return Self::open_dir(path);
+        }
         let file = File::open(&path)?;
         let len = file.metadata()?.len();
         if len >= baked::FOOTER_SIZE {
@@ -185,6 +203,48 @@ impl Pak {
             names,
             blocks: Vec::new(),
             cache: Mutex::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loose: None,
+        })
+    }
+
+    /// An unpacked client directory: every file under `path`, named relative to it (so a client root
+    /// with `game/` and `bin32/` matches the pak's own names).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_dir(path: PathBuf) -> io::Result<Pak> {
+        let mut entries = HashMap::new();
+        let mut names = Vec::new();
+        let mut loose = HashMap::new();
+        let mut dirs = vec![path.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_dir() {
+                    dirs.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let file_path = entry.path();
+                let name = normalize(&file_path.strip_prefix(&path).unwrap().to_string_lossy());
+                let size = entry.metadata()?.len();
+                entries.insert(name.clone(), Entry { offset: 0, size, packed: size, codec: baked::STORED, block: None });
+                loose.insert(name.clone(), file_path);
+                names.push(name);
+            }
+        }
+        Ok(Pak {
+            path,
+            file: None,
+            #[cfg(target_arch = "wasm32")]
+            remote: None,
+            entries,
+            names,
+            blocks: Vec::new(),
+            cache: Mutex::default(),
+            loose: Some(loose),
         })
     }
 
@@ -237,6 +297,8 @@ impl Pak {
             names,
             blocks,
             cache: Mutex::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loose: None,
         })
     }
 
@@ -328,6 +390,10 @@ impl Pak {
         if let Some(file) = overlay_file(path) {
             return std::fs::read(file);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(loose) = &self.loose {
+            return std::fs::read(loose_file(loose, path)?);
+        }
         #[cfg(target_arch = "wasm32")]
         web::reading(path);
         let e = self.entry(path).ok_or_else(|| {
@@ -354,6 +420,10 @@ impl Pak {
 
     /// The bytes of a file as stored (compressed, transformed) in an original or v1 baked pak.
     pub fn read_packed(&self, path: &str) -> io::Result<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.loose.is_some() {
+            return self.read(path);
+        }
         let e = self.entry(path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("not in game_pak: {path}"))
         })?;
@@ -395,6 +465,15 @@ impl Pak {
     /// Fills `buf` from `start` bytes into the file. A plain positioned read for stored files;
     /// a compressed file is decoded whole first.
     pub fn read_at(&self, path: &str, start: u64, buf: &mut [u8]) -> io::Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(loose) = &self.loose {
+            let file = File::open(loose_file(loose, path)?)?;
+            let size = file.metadata()?.len();
+            if start + buf.len() as u64 > size {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            return read_exact_at(&file, buf, start);
+        }
         let e = self.entry(path).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("not in game_pak: {path}"))
         })?;
@@ -473,6 +552,33 @@ mod tests {
     fn normalizes_paths() {
         assert_eq!(normalize("Game\\UI\\Hud.dds"), "game/ui/hud.dds");
         assert_eq!(normalize("./objects/a.cgf"), "objects/a.cgf");
+    }
+
+    /// An unpacked client directory works as a pak: reads accept both CryEngine-relative and
+    /// `game/`-prefixed names.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn reads_loose_dir() {
+        let dir = std::env::temp_dir().join(format!("aa-pak-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        std::fs::create_dir_all(game.join("objects/characters")).unwrap();
+        std::fs::write(game.join("objects/characters/a.cgf"), b"hello").unwrap();
+        std::fs::write(dir.join("top.txt"), b"top").unwrap();
+
+        let pak = Pak::open(&dir).unwrap();
+        assert_eq!(pak.read("objects/characters/a.cgf").unwrap(), b"hello");
+        assert_eq!(pak.read("GAME/objects/characters/a.cgf").unwrap(), b"hello");
+        assert_eq!(pak.read("top.txt").unwrap(), b"top");
+        assert!(pak.exists("objects/characters/a.cgf"));
+        assert!(!pak.exists("objects/characters/missing.cgf"));
+        assert_eq!(pak.read_string("objects/characters/a.cgf").unwrap(), "hello");
+
+        let mut at = [0u8; 3];
+        pak.read_at("objects/characters/a.cgf", 1, &mut at).unwrap();
+        assert_eq!(&at, b"ell");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Needs the real client (`AA_PAK` or `<client>/game_pak`).
