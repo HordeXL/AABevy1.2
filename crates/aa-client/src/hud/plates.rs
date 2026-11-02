@@ -43,8 +43,10 @@ const NPC_FONT_PX: f32 = 11.0;
 const PLAYER_FONT_PX: f32 = 26.0;
 /// Show the player's own plate (the capture has it: "Refone" over the character).
 const SHOW_OWN: bool = true;
-/// The font the client draws English UI text with.
-const FONT_PATH: &str = "ui/font/flareserif_821_roman.ttf";
+/// The font the client draws nameplate text with. The 1.2 client ships several; the original draws
+/// game text with this Simplified-Chinese font (FZ LanTingHei GBK, 22k glyphs incl. full GBK) so
+/// Chinese character and player names render instead of the Latin-only `flareserif` blanks.
+const FONT_PATH: &str = "ui/font/fzlantinghei_r_gbk.ttf";
 
 #[derive(Component)]
 pub struct PlateCamera;
