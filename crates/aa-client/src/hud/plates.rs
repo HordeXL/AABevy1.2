@@ -38,9 +38,9 @@ const BAR_H: f32 = 6.0;
 pub(super) const HEAD_GAP: f32 = 0.3;
 /// A character's height for the plate, metres: the plate sits over the head, not over the bow.
 const CHARACTER_HEIGHT: f32 = 1.85;
-/// Name sizes: NPCs, other characters (the client draws player names much larger).
-const NPC_FONT_PX: f32 = 11.0;
-const PLAYER_FONT_PX: f32 = 26.0;
+/// Name sizes: NPCs and other characters (both drawn at 14 px so Chinese names stay readable).
+const NPC_FONT_PX: f32 = 14.0;
+const PLAYER_FONT_PX: f32 = 14.0;
 /// Show the player's own plate (the capture has it: "Refone" over the character).
 const SHOW_OWN: bool = true;
 /// The font the client draws nameplate text with. The 1.2 client ships several; the original draws
