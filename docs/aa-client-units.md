@@ -221,8 +221,19 @@ Pending live checks:
 ### Dismount placement (S2, 2026-10-28)
 
 The local player's `SCUnitDetached` (`FUN_390a2e90`, `FUN_390a6110` / `FUN_390aaff0`) moves the character off the seat
-instead of leaving it where the mount stood; a remote rider still unseats in place (pending). The reason comes from the
-detach packet (AAEmu echoes the request: 9 for `UnMountMate`, 10 for `DismissPet` while mounted).
+instead of leaving it where the mount stood; a remote rider keeps the world seat `pose_riders` draws and seeds its walk
+from there. The reason comes from the detach packet (AAEmu echoes the request: 9 for `UnMountMate`, 10 for
+`DismissPet` while mounted).
+
+**World pose.** The 1.2 `OnUnitDetached` handler (`FUN_391d4a70`, `x2game.dll.c:363904-363909`) calls
+`FUN_39355bd0` -> `Unit::DetachFrom` (`FUN_390b4000`, `x2game.dll.c:148624-148630`), which clears the attach ids
+(`+0xebc` / `+0xebd`) and detaches the model; it never writes the parent-local packet point, so the actor keeps its
+world transform. `track_local_mount` composes the mount's current `Transform` chain (a ship times a cannon's local
+attach) with the rider's seat bone/helper at the detach and starts the get-off there; a slave attached to another slave
+is never a driven mount, and `cart::drive_cart` refuses a parented slave. A cannon on a hull follows `unit_parent` to
+the root `ShipModel` and lands on that hull's deck. Owner run 2026-11-01 15:32:02-15:32:08 (`rs-game.log`): the bound
+cannon's parent-local (-4.5703, -3.6836, 4.8404) was sent as world (the server measured 2872 m/s from 12008.822,
+9022.671, 105.118); the first `CSMoveUnit` now carries the world seat.
 
 * **Side (`FUN_3909b1a0`):** `forward` is the mount's local Y flattened; the candidate is
   `mount + forward * 1.0 + left * 1.5` (`DAT_39ac3888` / `DAT_39ac388c`). The left candidate's capsule is tested first,
@@ -324,6 +335,16 @@ Shininess 5.9, textures `transfers_trailer_a01_df/_sp/_ddn`. The copper boiler's
 vehicle parts are prepared with `Shading::Full` (native Illum, `aa-cry/src/shade/illum.rs`) instead of the default Basic
 world-prop path.
 
+A rigged prefab part also starts the animation its `AnimObject` names (`Part::animation`, `PrefabAnimation`):
+`FUN_39109d20` (x2game.dll.c:207499-207501) opens the Animation child node and reads `bPlaying`; the clip name
+(`Animation`) and `bLoop` playback are engine AnimObject behaviour. The dying Red Farm Hauler is the first case in the data: prefab
+`vehicle_tractor.tractor_body_dying` uses `transfers_trailer_a_body_dead.cdf` with `Animation="dead_01" bPlaying="1"`,
+and `dead_01.caf` is 3.33 s with 22 tracks (21 bound; `Bip01`, `Bone_Center*`, `Bone_Front*`, the wheels). The
+2026-11-02 capture shows exactly that: the cart burns, then tips and rolls onto its side between video 41 and 43.5 s,
+before the dead-prefab explosion at 43.6 (dying_time 3.3, death 39.4). The galleon's flag
+(`objects/env/06_unit/01_ship/galleon/galleon_flag0.chr`, `Animation="spreaded" bLoop="1" bPlaying="1"`) uses the same
+path. A one-shot authored animation keeps `VehicleIdle` stopped so the idle cannot replace its last frame.
+
 ### Engine idle and engine sound (`VehicleIdle`, `start_vehicle_idle`, `VehicleSound`)
 
 1.2 starts the prefab body's loop in `X2::PrefabUnitModel::UpdateIdleAnim` (`FUN_390d6690`) on model init and refresh
@@ -343,8 +364,7 @@ a rigged prefab part gets a [`VehicleIdle`] with the idle bound from its `.cal`,
 it (looping) whenever the body's `Animator` has no clip, the Bevy analogue of the 1.2 init/refresh.
 `creature::spawn_with_idle(..., play_idle = false)` keeps the generic creature idle from starting a vehicle body first.
 The exclusion is inherent: the driver only runs on prefab vehicle/ship bodies, and a body in damage state 5 or 6 keeps
-the loop stopped. The Bevy client has no dying state yet (PR #69 adds vehicle damage), so it gates on `Dead`
-(state 6) only. Twenty-two `vehicle_models` have a rigged part whose `.cal` has this idle (`1008 tractor`,
+the loop stopped. Twenty-two `vehicle_models` have a rigged part whose `.cal` has this idle (`1008 tractor`,
 `1277 tower_cannon`, `1293 hwang_ferrari`, `1323/1371/1406 speedcar1-3`, `1442 food_truck`, `1444 speedcar_decal`,
 `1460/1461/1462 speedcar_*_ucc`, `1464 tractor_b`, `1465 sigetank`, `1526 siegetank_prologue`, `1553 tractor_c`,
 `2 trebuchet`, `5 siege_tower`, `8000009 small_tractor`, `892/898/899 siegetank_a-c`, `990 siege_catapult_a`); three
@@ -378,14 +398,116 @@ resolves each unit once and marks it with `VehicleSound` (the pack and `vehicle_
 are cached in `SoundBook`), spawns the `engine` loop under the root with the initial parameters, and keeps the `run` child
 for the movement toggle. `sounds::update_vehicle_engine_sounds` writes the parameters only when the ratio changes, so a
 parked tractor is silent and a parked speedcar loops its idle engine. Native stops the `run`/`yaw`/`pitch` handles in
-state 5/6 and freezes the `engine` handle; the Bevy client has no dying state yet (PR #69), so it gates on `Dead`
-(state 6) and removes both sounds there - a deviation to revisit with #69. A resurrection puts the engine back and
+state 5/6 and freezes the `engine` handle; the Bevy client gates on the damage state 5 (dying) or `Dead`
+(state 6) and removes both sounds there. A resurrection puts the engine back and
 `vehicle::resume_vehicle_idle` starts the idle again.
 
 `VehicleIdle` also carries the body's `dead_01`/`dead_02` bind (the `Transfers_trailer_a_body.cal` has `dead_01`).
 `combat::ensure_corpses` only looks for an `Animator` on the root that carries `Dead`; a prefab body keeps its
 Animator on the child part, so `vehicle::stop_dead_vehicles` stops the idle there and plays the death clip. This is the
 pre-existing dead-01 gap for vehicle corpses, fixed on the vehicle path.
+
+### Summon emergence and portal (`SummonPortals`, `SummonEmergence`)
+
+The summon visual is an **emergence**, not a standing portal. The server broadcasts `SCSlaveCreatedPacket` (SC061,
+`OnSlaveCreated` `FUN_391d45d0`) around the owner before the unit state. `FUN_3934a6c0` (x2game.dll.c:681528) keeps a
+pending list keyed on the **timeline id** (packet `+0xc`, unit `+0x41c`): when `hideSpawnEffect` is clear it pushes
+that id (`FUN_3934a530`). `X2::GameClient::SlaveManager::Update` (`FUN_39349cb0`) calls `FUN_39349600`
+(x2game.dll.c:680653), which resolves the timeline id to the unit (`FUN_3935e3f0`), reads the slave's `slaves` row
+(`FUN_396d2570`) and calls the world's slot `0x2a8` = `FUN_390cf130` (x2game.dll.c:167908) with
+`portal_spawn_fx_id` (+0x58), `portal_scale` (+0x54) and `portal_time` (+0x5c).
+
+`FUN_390cf130` starts the emergence only when the time is above `DAT_3999c484` (0.0; confirmed in
+`x2game_unpacked.dll`), so slaves 54, 94 and 115 (time 0) get none. Otherwise `FUN_390ca1e0` allocates the emergence
+object (`FUN_39097140`, which starts the model's `portal_exhaust`) and `FUN_3909ea30` (x2game.dll.c:136679) sets it
+up:
+
+* the axis is the unit's forward (cry +Y) from the model transform's quaternion, projected to the horizontal plane and
+  normalised (`x = 2(qy qx - qw qz)`, `y = 2(qy² + qw²) - 1`, `z = 0`; `DAT_3999cffc` = 2.0);
+* `h = [bounds + 0x28]` (a bounding extent); the unit starts at `pos - axis * 2h`, the clip plane is at
+  `pos - axis * h` with normal `axis` (model vfunc 0xf8);
+* the portal group is anchored at the plane point (not the unit centre), oriented by the unit and scaled by
+  `unit_scale * portal_scale`;
+* `FUN_39097220` (x2game.dll.c:132165) moves the unit from the start to `pos` over `portal_time` ms
+  (`DAT_3999d1b0` = 1000.0) and plays the prefab's `portal_exhaust` each frame; `FUN_39097390` restores `pos`, clears
+  the clip plane, re-enables the model (vfunc 0x1a4(1)), stops `portal_exhaust` and sends the portal effect's end
+  event 5 (`FUN_393ed520(fx, 5, ...)`): emission stops and the live particles fade out.
+
+The ids are `fx_groups` rows, not `effects` rows: slave 146 (Red Farm Hauler, model 1553) is group 1263
+`portal_tank_spawn`, scale 3.0, time 1.0 s. Group 1263 holds the `FxParticle` items
+`abillity_skill_table_m.system_skill.portal_tank_main` and `..._main_start` and the `FxSound`
+`Sounds/x2eventsounds:portal:portal_tank` (`fx_items` 1742 / 1744 / 1760). 67 of the 140 `slaves` rows carry a spawn
+portal and every one is a `VehicleModel` or `ShipModel`; slave 15 (the rowboat) has none. The tractor body's `.cal`
+has no spawn clip (only `fist_ba_relaxed_idle` and `dead_01`), so the emergence plus its portal is the summon visual.
+
+`vehicle::track_summon_portals` keeps the SC061 timeline ids whose `hideSpawnEffect` is false in `SummonPortals`
+(until the unit root exists, like the 1.2 pending list, capped at 64). A later creation with `hideSpawnEffect` for
+the same timeline id clears the wait, and an entry whose unit never appears expires 10 s after the packet (1.2
+resolves against unit existence, not drawing). `spawn_summon_portals` resolves the ids in one pass over the drawn
+roots, skips `portal_time <= 0`, starts
+`SummonEmergence` and the world-anchored portal at the plane point, and plays the prefab's `portal_exhaust` if it has
+one (the galleons do, the tractor does not). `animate_summon_emergence` moves the unit root from the start to its
+position; `end_summon_portals` stops emission at `portal_time` (`FxRun::stop_emitting`), and
+`despawn_summon_portal_effects` removes each effect after its longest particle life (with a fallback cap) so a
+continuous or rebuilt simulation cannot linger. A vehicle that merely streams into view later was never announced by SC061 near the
+client, so it has no entry and plays none; a creation with `hideSpawnEffect` plays none either. Both controls are in
+`examples/slave_summon.rs` and the unit tests.
+
+The 2026-11-02 original-client capture (`<capture-root>/handoff/2026-11-02-vehicle-visuals-capture.md`, owner
+recording) confirms the result: an upright golden oval ring ~2x the cart height whose plane is perpendicular to the
+cart's length, the cart slides out along its own long axis (cargo end first) over `portal_time` 1.0 s, the part still
+behind the ring is invisible, the ring stays at the start end, and it fades into golden streaks for about 1 s after
+the cart arrives (~2 s visible). The static `_main_start` item is the one-frame white-violet flash (a 0.25 s
+refraction sphere and glow); the authored particle lifetimes produce the streak fade after the end event. The ring's
+orientation comes from the unit's quaternion in `FUN_3909ea30` (`+0x64` is the unit rotation, `+0x74` the plane
+point), which is what `SummonPortalAnchor` uses.
+
+The clip plane is implemented: `apply_emergence_clip` hides the unit for the first frame and gives every mesh a
+per-vehicle `IllumMaterial` clone whose `clip_plane` is `(axis, -axis·plane)`; `illum.wesl` discards behind it under
+the `ILLUM_CLIP` shader define (ordinary materials keep their early depth), and `illum_prepass.wesl` does the same in
+the prepass. An opaque clone becomes `AlphaMode::Mask`, which is what makes bevy_pbr build a fragment stage for the
+depth-only prepass and shadow pipelines (`MAY_DISCARD`); without it the hidden part still wrote depth and cast a
+shadow. `restore_emergence_clip` puts the shared materials back after `portal_time`, but only on a mesh that still
+holds its clipped clone (a stealth material change wins). Parts that are not `IllumMaterial` (none of the vehicle
+parts in the data) would not be clipped. The model enable call (vfunc 0x1a4) has no direct equivalent. `h` stands in
+for the native `[bounds+0x28]` with the largest horizontal half extent of the combined model bounds. The pending list
+survives visibility loss like the 1.2 list.
+
+`spawn_summon_portals` starts the group's sounds through the skill audio path (`sounds::Audio`, class `Skill`): the
+`FxSound` items and each `FxParticle` item's `fx_particles.sound_id` (the same field as a skill effect's particle
+sound), and the particle library's own emitter `Sound=""` events, deduplicated and played once at the portal anchor.
+Land group 1263 has the `FxSound` item 1760 `Sounds/x2eventsounds:portal:portal_tank`; sea group 619's particle item
+890 has `fx_particles.sound_id` 2413 `Sounds/x2eventsounds:portal:portal_ship_15`. Both groups' items offset 0, so
+they all hang at the anchor. The sounds were missing before this slice; a muted run (`--mute`) starts none.
+
+Sea variant (Eznan Cutter, slave 21): the data gives group 619 `배포탈_열림x10`, scale 10.0, time 7.0 s, whose single
+item is `X2_EFFECT_O.Interaction.shipportal_open_main_x15` (a water column, no tank ring), played at the plane.
+
+The portal emergence code has **no ship branch**: `FUN_3909ea30`/`FUN_39097220` (x2game.dll.c:136679 / 132165) always
+slide the unit along its forward projected to the horizontal, through a vertical clip plane, for `portal_time`. The
+captured Eznan Cutter rises vertically and rights itself; the **inferred** attribution is its CryPhysics buoyancy
+body. `FUN_390df580` (x2game.dll.c:179095) builds that body: it scans the prefab's objects for names starting with
+`buoy` (`XlComparePrefixI`, x2game.dll.c:179531) and, when there are none, builds the float body from the ship
+descriptor's keel tube (`tube_length` / `tube_radius` / `tube_offset_z` / `keel_offset_z`), mass box
+(`mass_center_*` / `mass_box_size_*`) and floats it with `water_damping` / `water_density` / `water_resistance`
+(fallback at x2game.dll.c:179577 ff.; `galleon.xml/galleon.step_10galleon_normal` has no `buoy` object). It is
+reached through the model vtable (`FUN_390e2220` / `FUN_390e3530` / `FUN_390eb720`), **not** directly from
+`ShipUnitModel::Init`/`Update` (`FUN_390e8b30`, x2game.dll.c:185704 / `FUN_390ebc50`, x2game.dll.c:187637, which
+do not reference it); the captured rise/righting is therefore taken as the model physics, not the portal animation,
+but that link is **capture-inferred**, not proven by the decompile.
+
+The Bevy emergence reproduces the result for a `ShipModel` when a water surface is known at its position
+(`WaterQuery`): it keeps the native horizontal start (`end - axis * 2 * extent`), linear slide and native anchor
+x/z (`end - axis * extent`, `FUN_3909ea30` state +0x74), but starts the root with the hull top at the sea
+(`ship_models.mass_center_z + mass_box_size_z / 2`, via `Db::ship_hull_height`), pitched bow up, and eases the rise
+and the righting to upright over `portal_time`; the clip plane is the horizontal sea surface (normal +Y, the native
+anchor x/z lifted to the water) instead of the native vertical portal plane, so the submerged part is not drawn.
+The horizontal-only ship clip is **capture-inferred**: the native code has only the vertical plane. The pitch is 50°
+(the capture's 45-60° mast/yard line); the start depth, the pitch angle and the easing curve are **capture-inferred**
+(2026-11-02 Eznan Cutter capture, `<capture-root>/handoff/2026-11-02-vehicle-visuals-capture.md`), not decompiled
+constants. The captured timing (first mast inside the burst, sails +0.9 s, upright with a bow wake ~3.5 s into the
+7 s) is the reference; our rise is the same shape but is not frame-exact. Without a water query the ship takes the
+land path exactly as before (start/plane/clip unchanged).
 
 ### Damage states (S15)
 
@@ -449,12 +571,26 @@ poller never returns 5: dying is entered by the death path below.
   objects: 78 active `exhaust`, 7 inactive `portal_exhaust`, 7 inactive `splash_l` + 7 `splash_r`, 10
   inactive `_spawn_effect`, 3 inactive `_despawn_effect`, and 2 active `_spawn` + 2 active named
   particles (`caravel_cruise_pool`, `airship_smoke`); only the exact speed-driven names are filtered, the
-  other active authored emitters stay.
+  other active authored emitters stay. The game adds `aa_fx::FxPlugin` (`main.rs:63`), which loads
+  `X2_EFFECTS` and simulates these `Effect` entities. `examples/vehicle_damage` adds it too and checks the
+  Red Farm Hauler's dying fire (`X2_EFFECTS.housing_test.housing_fire_b`) and dead smoke/explosion
+  (`X2_EFFECTS.fire_smoke.burning_smoke_01`, `X2_EFFECTS.housing_test.small_ship_exp`) are spawned. A
+  burst (no `Continuous` emitter, like the explosion) is never primed: priming would advance its whole
+  life past the first frame. Vehicle prefab effects retire when finished, and the dead `_dead_effect`
+  plays only on a worsening transition into 6, not for a slave that arrives already dead.
 * **Dying prefabs.** 19 of the 24 `vehicle_models.dying` prefabs are built on a `.cdf` AnimObject
   (`transfers_trailer_a_body_dead.cdf`, the trebuchets, the speedcars), 2 on a `.chr` and 2 on a `.cgf`
   brush. `vehicle::prepare` treats a `.cdf` part as a rigged creature model (like `.chr`), so the dying
-  body is drawn. The prefab's own `Animation="dead_01"` attribute is not selected by the part reader; the
-  `.cdf` is spawned with its default pose, which is the remaining approximation of the dying look.
+  body is drawn, and the part's authored `Animation="dead_01" bPlaying="1"` now plays as soon as the
+  prefab is spawned (`Part::animation`; `FUN_39109d20`), with or without a `Dead` marker. On the Red Farm
+  Hauler this is the captured tip/roll (video 41-43.5, `dead_01` 3.33 s); the dying-prefab unit test
+  checks the authored clip is the one the body plays (`examples/vehicle_ship_death` covers only the ship).
+* **Wreck lifetime.** There is no client wreck/corpse timer for a slave. `SCSlaveRemoved` only clears the
+  owned-slave timeline (`FUN_391d4660` -> `FUN_39345cb0` -> `FUN_39345780`); the drawn unit stays in the
+  world. `SCUnitsRemoved` removes it (`FUN_391d4cd0` -> `FUN_39366480`). The 2026-11-02 frames show the
+  Red Farm Hauler wreck still drawn at video 60 s (the nameplate and red cargo are visible; the earlier
+  "gone at ~55.3 s" reading was a camera pan), i.e. until the server's packet at log 12:36:02, 21 s after
+  death. The Bevy path does the same (`units::receive_moves`: only `UnitsRemoved` despawns a unit root).
 * **Dead look.** The `dead` prefab is a wreck model (rowboat/galleon `*_dead.cgf`). Those files put
   their meshes under a plain-named helper container; `aa-cry`'s LOD 0 rule accepts that (the mesh is
   still drawn, `mesh::tests::a_dead_vehicle_hull_is_drawn_under_its_helper_container`). A sweep of every
@@ -463,6 +599,37 @@ poller never returns 5: dying is entered by the death path below.
   hulls) and no model has both a compiled `Merged` node and its source meshes drawn. The ship entity,
   motion and float behaviour stay; the server owns the 20 s despawn. The engine sound and idle gate at
   states 5/6 belongs to `vehicle-idle-anim` and is not duplicated here.
+
+### Ship damage and death (Eznan Cutter)
+
+The 2026-11-02 capture (`<capture-root>/handoff/2026-11-02-vehicle-visuals-capture.md`, "Eznan Cutter damage and
+death") is the evidence for the ship half of S15; the prefabs are the game's own.
+
+* **HP stages.** `slave_healing_point_doodads` rows for template 21 are doodads 2510/2511/2512/2513 at attach points
+  36-39 (`galleon.galleon_repair01/04/03/02`). The server's `UpdateSlaveRepairPoints` spawns them as parented
+  `SCDoodadCreated` doodads when the HP crosses 75/50/25 %; Bevy announces them through `Event::DoodadsSpawned` and
+  draws each under the ship root (`units::sync_views` / `doodad_model`). Their prefabs carry the `repair_doodad`
+  particle. The state prefabs are `galleon.damaged25` (state 2/3) and `galleon.damaged75` (state 4); the latter's
+  `effect_fire` emitter is `X2_EFFECTS.e_effect.ship_damage_fireflame` (the captured aft-deck fire at 25 %).
+  `the_eznan_cutters_damage_effects_and_doodads_are_readable` checks the four hp doodads, the 16 drop doodads and
+  both effects against the real data.
+* **Death has no explosion.** `models.dying_time` is 0 and `ship_models` has no dying column; state 6 is
+  `galleon.dead`, which names only the active `X2_EFFECTS.e_effect.caraval_water_destroy` burst and no `_dead_effect`.
+  The old damage prefab's smoke is dropped with the swap (the capture's smoke clears within 1 s), while its fire is
+  re-spawned at the same authored anchors (`carry_ship_fire`) so the wreck keeps burning, as in the capture
+  (`ship_sinking_t358.66`, `ship_sunk_burning_t365`).
+* **Debris.** The server's `DistributeSlaveDropDoodads` (`slave_drop_doodads`: 1327, 1322, 1323, 1324 and 12 x 1330)
+  creates 16 doodads around the hull; Bevy draws them like any `SCDoodadsCreated` doodad.
+* **List and sink.** The original client's sink is not in the decompiled ship update (no damage-state gate) and the
+  server removes the ship from its physics at death, so `WreckSink` reproduces the captured motion client side: a
+  smoothstep over 12 s, 14 m down, with a bow-up pitch and a heel (`WRECK_SINK_*`). The mechanism is **inferred**
+  from the capture (the engine physics that produced it was not recovered); the hull is still visible at 365 s
+  (~12.6 s after death). The offset is applied by `units::move_units`, which writes the root only while the pose
+  changes; once fully sunk the fixed offset is reused, so a stationary wreck is not rewritten every frame. A heal
+  removes the sink and restores the server pose. A ship that is already dead when it enters view (streamed corpse,
+  reconnect within the ~20 s window) has no death swap to start the sink: `start_dead_ship_sinks` places it at the
+  end pose and carries the 25 % prefab's fire (**inferred**; the client has no death timestamp for it).
+  `examples/vehicle_ship_death` checks the burning wreck, the missing explosion, the water effect and the sink.
 
 Left out: the speed-driven exhaust/splash scale (`FUN_390c78d0`), `_despawn_effect`, the ship deck floor
 of a dead hull (the deck still uses `ship_models.normal`), and the engine sound (`FUN_390c6780`, needed
@@ -554,12 +721,16 @@ and explicit controls").
   **surface gap** of the collision shapes (`FUN_3989bf90` -> `FUN_398b1ab0` ->
   `FUN_398b1af0`): the minimum over the target's colliders of
   `|centre_player - centre_slave| - (r_player + r_slave)`, not clamped at 0, compared strictly
-  (`gap < limit`). The exact per-collider shapes are not recovered; the port uses one scaled
-  actor-model radius per unit (the same `GameData::model_size` as the server's `Unit.ModelSize`
-  and `api::distance_to`), an approximation (unverified). The 2026-10-28 capture bound at a
-  3.1022 m centre-to-centre 3D distance with no walking; the capture's Farm Wagon (slave
-  template 60, model 1008) has no actor-model radius (it is a `VehicleModel`), so the player
-  radius alone (0.4-0.55 m for the 1.2 races) leaves a 2.55-2.70 m gap. Then `CSBindSlave` 0x031
+  (`gap < limit`). The exact per-collider shapes are not recovered; for a vehicle or ship the
+  port uses the body's prefab AABB (the box the summon placement uses, `GameData::vehicle_box`
+  / `hud/slave.rs::slave_gap`) in the slave's yaw frame, like the server's ship mass box and
+  attach-point stand-in; other units keep one scaled actor-model radius (the same
+  `GameData::model_size` as the server's `Unit.ModelSize` and `api::distance_to`). This is the
+  approximation the 2026-11-01 retest needed: the Red Farm Hauler's cargo bed is in reach while
+  its origin is more than 3 m away. The 2026-10-28 capture bound at a 3.1022 m centre-to-centre
+  3D distance with no walking; the capture's Farm Wagon (slave template 60, model 1008) has no
+  actor-model radius (it is a `VehicleModel`), so the player radius alone (0.4-0.55 m for the
+  1.2 races) leaves a 2.55-2.70 m gap. Then `CSBindSlave` 0x031
   goes out (`FUN_393bf310` -> `FUN_39362f50` -> `FUN_393464a0`, `SlaveCommand::Bind`). Out of
   reach the native client auto-walks (`FUN_390a6af0`); this port has no walk-to-unit, so it
   refuses with 0x9a. The mounted 3.5 m variant is modelled from the player's received
@@ -645,29 +816,66 @@ and explicit controls").
   check on that bound slave's object id (`this+0x18`): both use the BOUND slave, not the seat, so
   a player seated on another slave still discards the bound one. The driver branch is keyed on
   `this+0x14`, the slave SCSlaveBound named as the local player's master, not on the seat point.
-  With it the unbind is refused while the bound slave's speed squared is above
-  `_DAT_3999f85c` 25.0 (5 m/s) with `SLAVE_SHUT_OFF_TO_UNBIND` 0x67. Without it `FUN_39362170`
-  sends only from an attachment above point 1 (no speed check, 1500 ms throttle) and is silent for
-  a point-1 seat that is not the player's. The speed is the latest replicated
-  `SCOneUnitMovement` velocity (`Movement.velocity`: 1/1024 m/s, 30/32767 m/s for a type-2 vehicle
-  body), or the controller speed for the cart this client drives (`cart::CartDrive`, which no
-  `UnitMoved` reports), treated as 0 after 500 ms without a new report (a port bound, **not a 1.2
-  value**); the native getter `vtable+0xa4` is an engine speed, so this source is **unverified**.
-* **Passenger walk-off.** With the own attachment point above 1 on a slave, movement input
-  (`moveforward`, `moveback`, `moveleft`, `moveright`, `turnleft`, `turnright`, `autorun`, and
-  the world mouse buttons through the same `resolve_keys` mapping `control_player` uses: both
-  buttons run forward, one button makes A / D strafe) sends the parent's 0x032 through
-  `FUN_39362170`, throttled to one request per 1500 ms (`_DAT_3a169948`). That native path has no
-  speed check, unlike the driver's `FUN_39345aa0`. Like `talk_input` it is skipped while the HUD
-  is suspended or loading, while a widget has the HUD focus, and while the UI owns the keyboard
-  (typing in a field); mouse buttons held over a HUD widget are ignored like they are on foot.
+  With it the unbind is refused with `SLAVE_SHUT_OFF_TO_UNBIND` 0x67 only when **both** hold: the
+  bound slave model's +0x2a0 slot is non-zero, and the model's entity velocity squared is above
+  `_DAT_3999f85c` 25.0 (5 m/s). `FUN_39345aa0` (677646) puts the check inside
+  `if (model[+0x2a0] != 0)`. For a `VehicleModel`, `X2::VehicleUnitModel::Init`
+  (`FUN_390f0510`, 190001) copies the slot from the model descriptor's +0x72, which the client's
+  `vehicle_models` loader (`FUN_39736bd0`, 1581965) fills from column 0x20
+  (`use_wheeled_vehicle_simulation`; +0x74 is `velocity`, +0x78/+0x7c `wheel`/`wheel2`). Carts
+  are false (model 1008 Farm Wagon, model 1553 Red Farm Hauler) and the speed cars are true
+  (vehicle models 45-48, 50, 52, 54-56). A `ShipModel` keeps its 0x198-byte ship object pointer
+  in the same slot (`FUN_390bdf70`, 156143-156149, the ship base vtable 0x399a56d0 slot 0x50;
+  the ship dtor deletes it), so a ship driver is refused too - **inferred** from the pointer
+  byte test, **capture-pending** (a ship dismount above 5 m/s has not been recorded). The
+  2026-11-01 owner capture sent 0x032 at ~6.7 m/s on the hauler (slave template 146) with W held
+  and got off, no 0x67; the client reads the gate from `AA_DB` and a model the data does not name
+  is not gated (the server still decides the unbind). The speed is the latest replicated
+  `SCOneUnitMovement` velocity through `Movement::velocity_mps`: 30/32767 m/s for a type-2 land
+  vehicle and a type-3 ship body, 50/32767 for a type-5 transfer, 1/1024 for a unit movement. (A
+  type-3 body read at 1/1024 would make a real 4.8 m/s ship read 5.12 and refuse it.) The
+  controller speed covers the cart this client drives (`cart::CartDrive`, which no `UnitMoved`
+  reports); the speed is treated as 0 after 500 ms without a new report (a port bound, **not a
+  1.2 value**). Without a bound master `FUN_39362170` sends only from an attachment above point 1
+  (no speed check, 1500 ms throttle) and is silent for a point-1 seat that is not the player's.
+* **Vehicle seat frames.** A vehicle seat is the body helper named by
+  `model_attach_point_strings` (point 2 is `$passenger0`, point 1 `$driver`). A **passenger**
+  helper's matrix is the attachment frame: its translation and **full** authored rotation (a
+  quaternion, not yaw only) compose with the vehicle's world rotation
+  (`ingame/mount.rs::rider_rotation`). Driver and other helper frames are not rider frames: the
+  real data authors `$driver` 180 degrees on model 129 (`ShipModel`) and 772 (`singboat`), and
+  `$cannonN`/ladder/box helpers carry prop rotations; applying them would turn or tilt the
+  driver/gunner. They are left on the mount rotation.
+  Real passenger frames: model 1553 Red Farm Hauler `$passenger0` 180 degrees about model Z;
+  models 314 (`maritram`), 653 (`carriage_trailed`) and 1459 (`ghostcarriage_trailed`) also 180;
+  the speedcar/car passenger helpers (1293/1323/1371/1406/1444/1460-1462) are a 23.1-degree
+  recline. Model 1008 Farm Wagon has only an identity `$driver` and no point-2 helper in 1.2. The seat clip
+  `fist_ac_trailer_sit_idle` has an identity Bip01 root, so it adds no turn of its own; the
+  passenger's turn comes from the `$passenger0` attachment frame.
+  Why the old identity mount rotation faced the rear: the rider was drawn in the mount frame and
+  the `$passenger0` attachment frame (the only 180-degree frame in the seat data) was not
+  applied; whether the native composition also includes a body/bind-root turn is not captured.
+  The owner's Bevy retest and the real-data test pin the corrected frames.
+* **Passenger leaving.** With the own attachment point above 1 on a slave, the explicit dismount
+  skill/button sends the parent's 0x032 through `FUN_39362170`, throttled to one request per
+  1500 ms (`_DAT_3a169948`). That branch has no speed check, unlike the driver's `FUN_39345aa0`.
+  Movement input does **not** leave the seat. This is now captured on the real 1.2 client
+  (2026-11-02 12:30, owner, Red Farm Hauler passenger via G): W between 12:30:00 and 12:30:06 sent NOTHING
+  (no CSMoveUnit, no CSDiscardSlave); the 12:30:06 CSDiscardSlave came from the R dismount
+  skill. The decompile path `FUN_39406540` (`InputManager::Update`) -> `FUN_39404d50`
+  (:843283-843297) -> `FUN_39362170` (:700266) does send 0x032 for parent type 2 / attach point
+  not 0/1, so for a passenger it must be blocked by one of its guards: the input-block flag
+  `*param_1 != 0` (calls `FUN_39402b30`, which resets the axis/controller state and calls the
+  model's +0x44), `FUN_39055fa0` / the `+0x480` flag (UI/script input capture), or the player's
+  model controller `local_60[0x74]` (a scripted/vehicle controller owns the body). Which guard
+  applies is unresolved. The client keeps the seat.
 * **Not ported here:** ships, and the despawn/destroy lifecycle (0x02f/0x030).
   Cart driving and the wheel visuals are in the next section. The player flags at +0x3a70..+0x3a73/+0x3a7b (native 0x13)
   and the parent unit type 0xe (native silent refusal) are also not ported: their meaning is
   unverified.
   The mode bar's `unbind` function slot now calls the same `FUN_39345aa0` path (driver 0x67 above
-  5 m/s, passenger `FUN_39362170` throttle); the Lua entry point and the passenger walk-off remain
-  the other two ways a client action sends the unbind.
+  5 m/s, passenger `FUN_39362170` throttle); the Lua entry point is the other way a client action
+  sends the unbind.
 
 #### Pending live checks
 
@@ -700,9 +908,17 @@ and explicit controls").
   (`CANT_DO_WHILE_YOU_DEAD`) shows the same text.
 * The player flags +0x3a70..+0x3a73/+0x3a7b -> 0x13 and the parent unit type 0xe silent refusal,
   both not ported.
-* Leaves and stale state: 0x032 followed by `SCUnitDetached` 0x077, 0x67 above 5 m/s, and the
-  native speed source and staleness (the port ages the last velocity after 500 ms, not 1.2);
+* Leaves and stale state: 0x032 followed by `SCUnitDetached` 0x077, 0x67 above 5 m/s on a
+  gated model (wheeled-simulation vehicle or ship), and the staleness bound (the port ages the
+  last velocity after 500 ms, not 1.2);
   `SCSlaveDespawn`/`SCEscapeSlave`/`SCSlaveRemoved`/visibility loss clearing the bound slave.
+* A live leave on a wheeled-simulation car at 5-15 m/s: the data gate and the capture cover the
+  cart; the car's own 0x67 has not been recorded.
+* A ship driver's leave above 5 m/s: `FUN_390bdf70` leaves a non-zero pointer byte in the ship
+  model's +0x2a0, so the refusal is **inferred**, not captured. It allocates the 0x198-byte
+  object only when `param_2 != 0` and `*(DAT_3a5bb1d8 + 0x94) != 0` (DEC 156143), so a ship that
+  is not crewed or a disabled cvar keeps 0 on this slot. The pointer's low byte could in
+  principle be 0 too (the native tests only that byte); the port gates every `ShipModel`.
 * The 1500 ms agent throttle, the driver/passenger seat difference, a non-owner passenger, and
   whether any mounted-HUD button or key (not just `DiscardSiegeWeapon` and movement) leaves.
 * A slave with a zero timeline (the port stays silent; not a 1.2 check), and whether movement
@@ -747,8 +963,11 @@ The 1.2 slave interaction offers two seat skills on the target unit. `hud/slave.
   input with the smoothed hull). `mount.rs` tests cover two remote passengers at different helpers and
   a moved cart transform (capture-pending S11-C4).
 * **Leaving.** The local driver uses `DiscardSiegeWeapon`/the speed-guarded 0x032 (S5); a passenger
-  walks off on movement input (1500 ms throttle) or sends the same 0x032. On `SCUnitDetached` the local
-  seat clears and the mover starts from the seat helper, as before.
+  sends the same 0x032 from the explicit dismount skill/button (1500 ms throttle). Movement input
+  keeps the seat: the 2026-11-02 12:30 real 1.2 capture sent nothing on W (the R skill did the
+  unbind); the decompile path must be blocked for passengers by one of its guards (unresolved).
+  On `SCUnitDetached` the local seat clears and the mover
+  starts from the seat helper, as before.
 
 Capture-pending (S11):
 
@@ -1277,10 +1496,17 @@ vehicle_models` row has turret limits. `ingame::turret::slave_turret` reads the 
 `Db::turret_limits` (degrees and deg/s into radians). A row with a non-numeric angle (vehicle_models 5,
 the siege ladder, has the text `f` in `turret_yaw_angle_max`) is skipped, not read as zero.
 
+* **Slave kind.** `UnitKind::Slave.id` is the server's persisted slave id, not its kind. The 1.2
+  client keeps the unit-state template id at `Unit+0x420` (`FUN_398a1f90` copies net `+0x448`,
+  `x2game.dll.c:1937685`), tests base unit type 2 and looks it up with `FUN_39696380(Unit+0x420)`
+  (`FUN_39345ea0`, `x2game.dll.c:677830-677836`), then reads `slaves.slave_kind_id`
+  (`x2game.dll.c:1482520/1482585`); `FUN_39571630` names 7 `siege_weapon` and 8 `slave_equipment`
+  (`x2game.dll.c:1140951-1140971`). `Db::slave_kind` does that lookup from `UnitKind::Slave.template_id`
+  for ship and ground cannons alike (slaves.id 10 = kind 8, model 117).
 * **Boarding.** The existing `CSBindSlave` 0x031 interaction (`hud/slave.rs`, skill 12076) seats the
   gunner at point 1 of the cannon; `track_local_mount` marks that seat `LocalSeat.turret` when the
-  slave is kind 7/8 and its `models.sub_type = 'VehicleModel'` row parses to a non-zero turret
-  range. That is the 1.2 controller type 3 (`FUN_390b3750` = `X2::VehicleUnitModel`, S12-C6). A
+  slave's template kind is 7/8 and its `models.sub_type = 'VehicleModel'` row parses to a non-zero
+  turret range. That is the 1.2 controller type 3 (`FUN_390b3750` = `X2::VehicleUnitModel`, S12-C6). A
   drivable catapult or tank is a turret seat too and keeps driving through the cart path; the
   all-zero rows (vehicle_models 37/40) are not turrets. `turret_seat_model` is the gate; a
   real-data test walks every kind-7/8 `slaves` row. The gunner's `player::control_player` locks
@@ -1398,3 +1624,9 @@ Capture-pending (case ids; every one has a capture step):
 TODO(#58 child units): when the `child-units` branch lands, `turret::local_aim` should read
 `units::current_transform` instead of the drawn `GlobalTransform`, so a cannon aboard a moving
 ship aims from its parent's transform (S12-C3). Until then it uses the replicated transform.
+
+`examples/slave_summon -- --ship` draws the Eznan Cutter rising and righting through a horizontal
+sea clip beside a streamed-in control. Use `--shot-after 4` to capture the middle of its 7 s emergence.
+
+The vehicle death and summon examples pause their simulation while render pipelines compile,
+so cold shader compilation cannot consume the short animation before `--shot` captures it.

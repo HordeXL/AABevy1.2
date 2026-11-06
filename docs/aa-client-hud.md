@@ -322,6 +322,15 @@ window is the script's). The wire formats are checked against the server's own b
 
 **Tab** targets the nearest living enemy (the next one when pressed again), any unit if there is no enemy.
 
+**Self target.** `F1` is `round_target` in the client's `default_binding.g` (`hotkey.g` records the same):
+the native `round_target` handler (`FUN_3942a080`) targets the local player, and pressed again while the player
+is the target it targets the own pet (`FUN_3933f5e0` on the pet manager; no packet without one). `self_target`
+(`FUN_393f8fb0`) targets the player. A left click on the player frame goes through the original script's
+`eventWindow` `OnClick` -> `X2Unit:TargetUnit("player")` (native `ChangeTargetForUI`). The own portrait's
+CSChangeTarget `0x02c` carries the player's own bc (owner session 2026-11-01 14:18: `21 5f 00`). Both paths set
+`Target` locally before the send. The player is kept in `Player`, not `Units`, so `panels::refresh` builds the
+target frame's self snapshot from the player's spawn unit with the HUD's current points.
+
 **Not done / assumptions.** The afterimage, shake and critical bursts; the plate shows no party, guild or PvP marks;
 auto-away after 300 s is a guess; the capture's side-on camera is only approximated by
 `--hud-side-cam` (the character is not exactly side-on); a unit's height has no source for models without a skeleton
@@ -386,7 +395,7 @@ End!" (`combat_death`), everything is dark while Recall is cast and only the tel
 | 2 | the skill's unit requirements (`unit_reqs`, `or_unit_reqs`): level, ability level, race, gender, a worn item in a slot (a sword in the main hand) or by template, an owned item, a learned skill, "not in combat" (Recall, Dash, the dances), a buff on me / on the target, a shield, a bow or an instrument. Quests, doodads, zones and factions count as met: the server decides | `Snapshot`, `Inventory`, `Skills`, `Buffs` |
 | 3 | buffs on the player: stun, sleep, knock down (every skill but those with `source_stun`), blank minded, silence (magic skills), crippled (melee and ranged) | `buffs` flags |
 | 4 | the player is casting (every other slot is dark, the skill being cast stays lit) or channeling; a cast whose end never came stops counting 2 s after it should have ended | `Skills.casting` |
-| 5 | the target: hostile, "others" and friendly-others skills need one (`NO_TARGET`), of the right relation (`INVALID_TARGET`: a rat for a heal, a friend for Triple Slash), alive or dead as the skill wants (`TARGET_DIED`) | `TargetSnap` |
+| 5 | the target: hostile, "others" and friendly-others skills need one (`NO_TARGET`), of the right relation (`INVALID_TARGET`: a rat for a heal, a friend for Triple Slash), alive or dead as the skill wants (`TARGET_DIED`). The auto attacks 2/3/4 and every `target_relation_id` 4 skill also need the attackable bit of `FUN_39838880` (`CanAutoAttackTargetUnit` `FUN_393be4e0`): neutral NPCs stay attackable (the type-3 `+0x40` flag and the force-attack/bloodlust flags are not recovered); `npc_tendency_id` is not evidence for the bit and is not read. The code is 0x2f `PROTECTED_FACTION` with the faction value only for a character (reason 1 via `FUN_39837d60`, value `target+0x3adc` unconfirmed), 0x30 `PROTECTED_LEVEL` for reasons 5/6, otherwise 0x22 `INVALID_TARGET` (`FUN_39898e60`). Reasons 2-6 only run when both owning-character ids (`+0x24`) are valid (`FUN_39356b60`: character/slave/house/mate/shipyard; an NPC or transfer is invalid), so the level protection is PvP-only and never applies to an NPC. Reason 2 (the attacker's unresolved `+0x30` byte) is not modeled. On relation 1, reasons 5/6 are the level protection (`FUN_39837a90`: level 10 or below) for the attacker (5) or the target (6); on relation 2/3, reasons 3/4 (same owning character `FUN_39837b40`, same party `FUN_398377c0`) come first and refuse as 0x22. `FUN_39898e60` writes no detail for 0x30 (the `skill_protected_level` text takes none). The zone value from `FUN_39027eb0` (`39098`) is a home zone's `zones.faction_id`, or a static `conflict_zones` row's `peace_protected_faction_id` while the runtime state is 7 (peace) and the row is not `closed` (any other state, no state or `closed` means 0; `FUN_390298d0`, `40895`); 5 protects every owned unit and 4 a unit friendly to faction 148 or 149 (`FUN_39837b90`); any other value is a faction the unit must be friendly to (`+0x4` relation state 3, Bevy's `GameData::relation`). The home-zone timed override that also returns 5 is not modeled. Bevy reads the player's `zone_faction`/`zone_group` for both sides (inferred: the target's own zone is not on `TargetSnap`) | `TargetSnap` |
 | 6 | range: the skill's `min_range` / `max_range`, or the reach of the weapon in the equipment slot `weapon_slot_for_range_id` names (fists 3 m, a sword 4); edge to edge, so 1 m is taken off the centre distance | both positions |
 | 7 | mana `((ability level - 1) * 1.6 + 8) * 3 / 3.65 * mana_level_md + mana_cost` (the skill's own ability level), labor points | `Snapshot.mp`, the ability exp |
 
@@ -463,6 +472,25 @@ Threshold", "Your last breath has escaped you.", the countdown, "Revive Here" / 
 `X2Player:GetResurrectionCountdown` counts the server's wait down on the HUD clock, `X2Player:Resurrect(inPlace)` sends
 `Command::Resurrect { in_place }`, `X2Unit:GetUnitNameById` answers for the player and the target.
 
+**Where the countdown comes from.** `SCUnitDeathPacket.resurrect_wait_time` (i32 ms, the server's escalating
+15/30/60... s wait) is the only duration the server sends; `SCNotifyResurrectionPacket` carries only the caster.
+`FUN_39369c10` (`x2game.dll.c:706612-706613`) stores the packet time in `[[g_connection+0x40]+0xaf4]` and that field in
+`+0xaf8` when the dead unit is the local player. `FUN_39495c00` (`GetResurrectionCountdown`, `x2game.dll.c:955710`)
+returns `(offer flag +0xafc, 300000 - elapsed, +0xaf8 - elapsed)`, both truncated to seconds: the automatic temple
+respawn is the client's five-minute constant, not the server wait. The window's `OnUpdate` calls
+`X2Player:Resurrect(false)` when the second value reaches 0 (`death_and_resurrection_window.alb` disassembly lines
+233-235); the buttons enable when the third does. Bevy used to open the window before `track_death` had stored the
+packet, so the deadline read 0 and the window auto-respawned in the same second (owner test 15:33:18). `track_death`
+now runs before `aa_ui::UiFrame` and `alerts::show`, and it takes the local id from `Player.spawn` (which survives
+`SCUnitsRemoved`) rather than `Skills.obj_id` (which drops its id when the player's own unit is removed; the 15:32:07
+teleport sent `SCUnitsRemoved` packets before the death).
+
+`X2Player:Resurrect` itself (`FUN_39186e70`, `x2game.dll.c:290981`) sends only while `+0xaf4` is set, the wait has run
+out and (for an in-place revival) the offer flag is set; a two-second debounce follows. Bevy applies the same gate in
+`handle_requests` and latches one request per death, so the countdown and a click cannot send twice. `Resurrected`
+raises `PLAYER_RESURRECTED` (`FUN_391d3ad0`, `x2game.dll.c:363191-363192`, which clears `+0xaf4` and `+0xafc`) and the
+window hides.
+
 The offer is its own event. The original's `OnNotifyResurrection` (`FUN_391d39f0`, `x2game.dll` line 363081) sets `[[g_connection+0x40]+0xafc]`
 and raises `PLAYER_RESURRECTION` (event 92) with one argument, the caster's live-object id as a hexadecimal string. The death window
 handles it with `ShowResurrectionMode(casterId)`: the title stays "Hereafter Threshold", the penalty line becomes
@@ -505,6 +533,76 @@ capture's colours within 3 %. The look is the capture's (about 40 px tall, 4-5 p
 NPCs within 45 m. The white beams over Maude in the capture are a particle effect of the NPC, not drawn.
 Quests can be tried with the GM chat commands `/quest add 330` / `/quest remove 330` (`--hud-type`), which
 also exercises the live updates.
+
+### Quest notices and the clock
+
+A refused request (`SCQuestContextFailed` 0x146) raises `QUEST_ERROR_INFO(err, qtype)`; the native
+`FUN_3937a130` first clears the quest's timer through `FUN_39379ea0`, so the directing window also gets
+`QUEST_LEFT_TIME_UPDATED(qtype, 0)`. `route_quest_notices` (`dialog.rs`) ends the directing window when
+the failed quest is the one the window itself shows (`quest_context_directing.alb` F37): `playLines`
+reports its questType through `HUD.quest_show` (the only setter; the quest is cleared when directing
+ends), so a late refusal for an older quest cannot close a newer window. The original scripts print
+`locale.questContext.errors[err]`. A failed quest unit (`SCQuestUnitReqFailed` 0x148) reports its
+`SkillResult` through the skill-result message first and then raises `QUEST_QUICK_CLOSE_EVENT(qtype)`,
+only when it is the current target (`FUN_39376590`), which closes the same window (F36). Quest mail (`SCQuestMailSent` 0x150, and `SCQuestRewardedByMail` 0x14e)
+raises `DOODAD_PHASE_MSG(text)` (`FUN_3937a650`, `FUN_3937a520`) with the `QUEST_MAIL_SENT` /
+`QUEST_REWARDED_BY_MAIL` `ERROR_MSG` text and the `quest_mails` name / the quest title as its `$1`;
+a failed reward mail (`success` 0) raises `QUEST_ERROR_INFO(0xb, qtype)` instead. A name the client
+cannot look up shows nothing.
+
+Timed quests count down from the local receipt time: on every `SCQuestContextStarted` / `Updated`
+`FUN_3937b240` stores the packet's `time_left_ms` as the end and the local timer as the start, and
+`FUN_39379e30` returns `end - (now - start) * 1000` (the server's `accept_time` is not used). An
+`Updated` whose status is not in progress (1) stores -1, so the next tick removes the clock and
+publishes `(qtype, 0)` (723452). `HUD.quest_left_time(qtype)` feeds
+`X2Quest.GetQuestContextLeftTime` (`quest.lua`) and reads -1 when there is no entry. Once a second
+(`FUN_3937cd80`'s 1.0 s constant) the tick publishes `QUEST_LEFT_TIME_UPDATED(qtype, remaining_ms)`;
+under 1000 ms it publishes 0 once and removes the clock (`FUN_39379ea0`), and a quest leaving the list
+clears the same way. The tick seeds a clock only once per instance (the login list has no Started
+packet); an expired clock stays gone until the server's next Started / Updated (`FUN_3937b240` is the
+only creator). A refusal latches the quest instance so the next tick does not bring the clock back;
+the next Started / Updated of that instance releases the latch and starts the clock anew.
+
+### Let-it-done and over-done
+
+`X2Quest:IsLetItDoneQuest*` / `IsOverDoneQuest*` are computed by `quests.rs` from the quest's step and
+counters, not read from the raw `quest_contexts.let_it_done` column; `quest.lua` returns the row values.
+The original (`FUN_397d6320` for let-it-done, `FUN_397d71b0` for over-done, called by
+`FUN_39376930` / `FUN_39376990`) asks:
+
+* let-it-done: the quest is not main (`detail_id != 2`), is flagged `let_it_done`, is not repeatable, is
+  in progress, is not finished yet, and its objectives add up to at least half of what the step asks
+  (`DAT_3999c47c` 0.5; score quests use `score` instead). The native passes the player's level
+  (`player+0x4b4`, set by `FUN_390b4930`) as a third argument; the recovered `FUN_397d6320` body does not
+  read it;
+* over-done: a non-main let-it-done quest, every objective complete (`FUN_397d7070`) and each
+  `min(done, 2 * count)` at least `ceil(1.5 * count)` (`DAT_3999c478` 1.5; score quests 1.5 times their
+  score). It does not test the quest status, so a quest the server already marked ready still counts.
+
+The objectives use the native set: one slot per Progress component from that component's first act, and
+only `FUN_397d3440` / `FUN_397d7070`'s act types 0, 1, 2, 4, 5, 0x31 and 0x32 (`QuestActObjZoneKill` sums
+`count_pk + count_npc`); score quests use 0, 1, 2, 4, 5 and 0x2b. A 0 count is not promoted to 1.
+
+Handing one in from the quest journal (`who` 0 in `X2Quest:TryCompleteQuestContext`) now sends
+`CSTryQuestCompleteAsLetItDone` 0x0dd (`u32` quest, `bc` NPC, `i32` selected); the native picks it in
+`FUN_3937b860` when the quest is not ready but `FUN_397d6320` holds. A ready quest keeps
+`CSCompleteQuestContext` 0x0d6. The native also raises `QUEST_CHAT_LET_IT_DONE` when a report doodad is in
+view (`FUN_3937b860` -> event 245, the doodad id as a string); no 1.2 script registers that event (checked
+the `x2ui` quest scripts), so the client does not raise it.
+
+A doodad that hands a quest in (`SCDoodadCompleteQuest` 0x14d, handled by x2game `FUN_391dc050` ->
+`FUN_393773a0`) raises `COMPLETE_QUEST_CONTEXT_DOODAD(quest, flag, doodadId)`. The flag is
+`FUN_397d42d0` of the quest's Ready component (an act type 0x14 `QuestActConReportNpc` or 0x15
+`QuestActConReportDoodad`): true opens the directing dialog (`quest_context_directing.alb` proto 33) and
+its confirm button sends from `d.dialog`; false goes through `quest_context.alb` proto 19 to
+`TryCompleteQuestContext(2, quest, doodadId, "", selected)`. `hud/dialog.rs` sets `d.dialog.doodad` and
+clears the NPC before raising the event, and skips a second event while directing.
+
+`FUN_3937b860` also refuses locally and raises `QUEST_ERROR_INFO(error, quest)` through the scripts
+(`FUN_3937a130`): error 2 when the ready quest's NPC/doodad is not in reach (`FUN_393761f0`), error 10 when
+a Reward step has `QuestActSupplySelectiveItem` and no reward is selected, and error 12 when the quest is
+in progress and not let-it-done. Nothing is sent for those. Local refusal events fire after the
+HUD state is released so the original handlers can query it and close their window.
 
 ### Quest cinemas
 
@@ -592,7 +690,11 @@ data); the icons are drawn natively from `ui/map/icon/npc_icon.dds` (24 px cells
   grey "?" in progress, the main / livelihood / repeat variants of the sheet). The capture's big map shows no "!" at
   Desireen, 170 m from where it stands, and its roadmap the two givers within 120 m (Maude and an NPC south west).
 * **Gravesite** (`corpse_pos`) while the exp lost can still be won back; **dots** (`hostile` / `friendly`) of the
-  units in view within 250 m when the roadmap's "NPC" check is on.
+  units in view within 250 m when the roadmap's "NPC" check is on. Their tooltip is the NPC template's name (like the
+  quest marks); a dot without one has no label. The 1.2 symbol table has no `MAP_TEXT` row for `M_FRIENDLY`/`M_HOSTILE`
+  (category 0x14 dots, `FUN_3904ce90`, `x2game.dll.c:73822-73823`); `LocalizeUiText` would answer
+  `"20 ?? M_FRIENDLY"` on that miss (`x2game.dll.c:942705` and `585013`). The no-label choice is inferred: 1.2's label
+  for these dots is not established.
 * **Filters.** The "Show Icons" window of the big map works: `markers.lua` keeps each check (`SetNpcFilter`) and the
   three folders (Merchants, Infrastructure, Housing Province) and leaves the filtered icons out of both maps; the
   roadmap's NPC check hides every npc-like icon until it is on, as the toolkit's `roadmap` widget does.
@@ -998,7 +1100,17 @@ Ctrl-E opens the original mailbox locally. It chooses a currently visible NaviOp
 function group within the lane's five-metre 2D send radius, when available; inbox reading also
 works without a mailbox. Native393b1040 emits numeric doodad ID plus boolean true; there is no
 invented interaction acknowledgement. The broader native interaction chooser and exact automatic
-end-distance behavior are still pending. Sending revalidates the selected mailbox against all
+end-distance behavior are still pending.
+
+The NPC talk/use reach is the common interaction reach of `FUN_393bf270` / `FUN_39093860`: a 3D
+surface gap strictly under `DAT_39ac79fc` 9.0 (3.0 m), or `DAT_39ac7a00` 12.25 (3.5 m) for a **dead
+target** (`+0x3c26` is the target's dead flag, set by `FUN_390b4df0`; `FUN_393be4e0` reports
+`TARGET_DIED`), not the old six-metre centre distance and not a mounted player. A right click beyond
+it walks to the NPC (`FUN_390a6af0`, the same scripted-forward walk the mount and doodad approaches
+use) and `CSStartInteraction` is sent only when the gap is inside the reach (2026-11-01). A target
+change, any F use (also when a doodad or loot takes the key), an in-reach doodad use or a click on
+another/hostile unit cancels the walk; a player on a slave seat, driving a cart or sitting on a seat doodad
+does not start it (the forward key would drive the vehicle or the seat blocks it). Riding a mate still walks. Sending revalidates the selected mailbox against all
 currently nearby mailboxes, rather than requiring it to remain the nearest. Hotkey consumption
 now completes before gameplay input, so Ctrl-E does not also move the character right.
 
@@ -1601,7 +1713,8 @@ Received proficiency points/grades back GetMyActabilityInfo; unknown totals (inc
 downgrade ACK without points) remain unknown. Unit-attribute item/buff modifiers are retained
 for the displayed modifier and labor calculation. Native SSE f32 labor rounding/previous-grade
 threshold selection matches independent original-byte oracle cases. This does not yet fold
-the separate enclosing-owned-house decoration bonus or emit the complete proficiency event set.
+the separate enclosing-owned-house decoration bonus, and the housing decoration
+ACTABILITY_MODIFIER_UPDATE path has no received decoration state.
 
 The native X2Item numeric-grade lookup now converts raw grades0/1 exactly once into the existing
 internal display-order tooltip path, returning the original raw itemGrade. Internal bag lookups
@@ -1825,10 +1938,30 @@ Received events update state before original callbacks, including four-argument 
 and grade notifications. Complete lane snapshots refresh the original page; the native
 SC136 handler itself ignores last and refreshes per packet (all current34 lane groups
 fit one packet). The explicit lane downgrade helper uses ALL raw rows, distinct from
-the original SHOW grade map. Housing proficiency modifiers and live transactions remain
-unverified; unsupported premium-cost paths are not claimed complete.
+the original SHOW grade map. A nonzero labor-packet point delta raises the native
+ACTABILITY_EXPERT_CHANGED (0xc3) with the localized group name, actual capped delta and
+total including unit-attribute modifiers; `chat/chat_msg_event.alb` prints the original
+`actability_value_changed` line (`|cFFFFF65EAlchemy proficiency rose +|,17;. Current
+proficiency: |,10000;` for a 9983+17 gain at the grade-0 limit) and the tab bar updates.
+The gain follows `FUN_397a9880`: `(int)(point*100f*0.01f)` capped at the grade-0
+up_limit, inserted at grade 0 when the entry is missing (returning that gain); otherwise
+language ids 21..30 use the grade-0 limit, id 19 the last grade's limit, and the rest the
+current grade's up_limit, with the total clamped to `[0, limit]` and the grade recomputed
+by `FUN_397a8640`. The callback delta is the applied difference, not the raw wire value.
+`SCAddActionPoint` (0x047, handler `391861f0`) feeds the same point add with no nonzero
+gate. The login snapshot only raises ACTABILITY_REFRESH_ALL, so it prints no gain.
+ACTABILITY_MODIFIER_UPDATE (0x54) follows the native buff manager: a buff add
+(`3938a3c0`), update (`393886c0`), tick (`393888b0`) or remove (`39389d60`) on the
+player, their own mate or own slave refreshes the page when the buff template has a
+modifier on the fixed actability attribute set (`FUN_398a8fe0`: 99..118, 138, 158..163).
+The tick refresh also needs the template's raw `duration != tick` and skips the final
+tick. Equipment changes do not raise it (the native `UNIT_EQUIPMENT_CHANGED` path
+refreshes the page separately). Housing decoration modifiers and live transactions
+remain unverified; unsupported premium-cost paths are not claimed complete.
 
-The full client suite passes168 tests (29 ignored,2.04s), including five focused tests.
+The focused proficiency module passes14 tests (1 ignored) in the current tree, including
+the login snapshot, gain, grade, action-point, new-entry, special-limit, over-limit clamp
+and buff-event checks.
 The exact ignored original-script pointer probe passes1 test
 in1.91s: upgrade Cancel/Confirm, delayed upgrade/downgrade replies, expansion Cancel/
 Confirm, unchanged certificate until its own receipt, and stale-character rejection.
@@ -3281,12 +3414,34 @@ order.
   added when the model has `model_bindings` point 2 (`FUN_390c9f70(2)`) and no unit is attached
   there. F / `ExecuteDynamicAction` sends `CSBindSlave` 0x031 for 12076 (`FUN_393b1de0` ->
   `FUN_393be280`), or the plain 13863 `CSStartSkill`.
-* **Summon Info**: `SHOW_SLAVE_INFO` opens the stock window, which shows the received name, class,
-  slave kind, lowercase hex unit id and any received slave equipment (`GetMountedSiegeWeaponInfo`,
-  `GetSlaveEquipSlotInfo`). `X2SiegeWeapon:GetVehicleInfo`, `GetSiegeWeaponSpeed` and
-  `GetSiegeWeaponTurnSpeed` are still stubs, so the window has no gear/handbrake/traction-control
-  block and no speed/turn-speed rows. It guards the nil values and logs no script error (the ignored
-  `original_summon_info_window_opens_on_show_slave_info` test opens it against the real UI/pak/DB).
+* **Summon Info**: `SHOW_SLAVE_INFO` opens the stock window (`scriptsbin/x2ui/slave/slave_info.alb`;
+  the 15:05 capture is "Summon Info" from the vehicle ring's "?" slot). Its rows come from
+  `X2SiegeWeapon:GetMountedSiegeWeaponInfo` (`FUN_394ab0d0`): the received slave name (`+0xc`),
+  `desc_name` from the slave template's localized name (`FUN_39696380(+0x420)` -> `+0x28`), `kind`
+  from that row's kind id (`+0x68`) through `FUN_39571630`, which the stock locale maps
+  `SLAVE_KIND` 100 ("machine" -> "Production Equipment"), and the lowercase hex unit id
+  (`FUN_39424820`). `slave_info_view.alb` labels the rows Type/Classification/Move Speed/Turn
+  Speed and calls `Update` each frame, so the motion rows are live.
+  `GetSiegeWeaponSpeed` (`FUN_394aabd0`) returns the velocity's length signed by its component
+  along the body's forward axis in m/s; `GetSiegeWeaponTurnSpeed` (`FUN_394aae90`) returns the
+  angular velocity's z times 57.29578 in degrees/s. Both inline only the first `FUN_39345f10`
+  branch (the player's `+0x3af0` attachment, unit type 2); the native second branch (`this+0x18`)
+  is not ported. Outside that branch they return the native fall-through number 0, never nil,
+  because `slave_info.alb` multiplies the value. A driven cart uses its controller speed and
+  effective yaw rate (`CartDrive::motion`; the rate is the wire `0.4 * steering` faded by
+  `(speed / 0.5).clamp(-1, 1)`, so a parked cart reads 0); a remote slave uses its last type-2/3
+  movement, reading 0 after `SPEED_STALE_AFTER` of silence. Ships (slave kinds 1..=4 and 9) read
+  0: the native gates on physics class 3 (living) or 4 (wheeled), and this port has no ship case
+  for those getters. The unit text is the database's `ui_texts` category 31 (`m/s`, `degree/s`;
+  the 15:05 capture's client data says `degrees/s`). Leaving the seat raises
+  `SIEGEWEAPON_UNBOUND` (event 98, `FUN_393628a0` / `FUN_39345dc0`), which `mode_action.alb` F5
+  uses to hide the window. `GetVehicleInfo` stays nil: `FUN_394ab270` needs the native
+  vehicle object's `+0x2a0` state, which this port has no source for, and the captured hauler
+  shows no gear/brake/traction block. A mate's bar is only `command_unmount`
+  (`FUN_392045f0`), so it has no "?" entry. The window's stock X closes it. The ignored
+  `original_summon_info_window_opens_on_show_slave_info` and
+  `original_summon_info_rows_follow_the_seated_hauler` tests open it against the real UI/pak/DB,
+  and `examples/summon_info.rs` draws it (slave 146, parked and at 5 m/s).
 * **Seat bar deviation**: 1.2 composes the seat bar and then appends the buff skills
   (`FUN_392044a0` runs after `FUN_39204500`), so its bar is the seat skills, the functions and the
   buffs. This port replaces the buff skills with the seat bar instead. Left as a documented gap.

@@ -13,7 +13,7 @@ use web_time::Instant;
 use aa_net::buff::BuffKind;
 use aa_net::items::ActionKind;
 use aa_net::model::UnitKind;
-use aa_net::state::{ActionBar, Buffs, Inventory, Skills, Target, Units};
+use aa_net::state::{ActionBar, Buffs, Inventory, Player, Skills, Target, Units};
 use bevy::prelude::*;
 use mlua::{Lua, Table};
 
@@ -107,6 +107,19 @@ pub struct TargetSnap {
     pub faction_name: String,
     /// `"friendly"`, `"neutral"` or `"hostile"` towards the player.
     pub relation: &'static str,
+    /// `CanAutoAttackTargetUnit`'s attackable bit (`FUN_39838880` 0x100): every unit is attackable
+    /// except a friendly one and one refused by the reasons below; the type-3 `+0x40` and
+    /// the force-attack/bloodlust flags are not recovered.
+    pub attackable: bool,
+    /// `FUN_39838880` reasons 5/6: the level-10 protection (`skill_protected_level`) applies to this
+    /// hostile or neutral/friendly target, because both owning-character ids (`+0x24`) are valid and the
+    /// attacker or the target is level 10 or below in a zone protected for its faction.
+    pub protected_level: bool,
+    /// `FUN_39838880` reasons 3/4 (`FUN_39837b40` / `FUN_398377c0`): on the neutral/friendly branch the
+    /// same owning character or the same party is refused as `INVALID_TARGET` before reasons 5/6.
+    pub invalid_attack: bool,
+    /// The unit's faction id, for the `PROTECTED_FACTION` refusal detail.
+    pub faction_id: i64,
     pub grade: &'static str,
     pub race: u8,
     pub gender: u8,
@@ -223,15 +236,44 @@ fn action_skill_slot(
     skill: u32,
     start: Instant,
 ) -> SlotSnap {
+    let cooldown = cooldown_slot(action_skill_cooldown(game, skills, inventory, skill, Instant::now()), start);
+    skill_slot_of(game, skill, cooldown)
+}
+
+/// `(left, total)` ms of the cooldown an action-bar skill slot shows (before [`cooldown_slot`] puts it on the HUD clock): the
+/// converted skill's for a linked skill. The skill trace reads it every frame.
+pub(crate) fn action_skill_cooldown(
+    game: Option<&GameData>,
+    skills: Option<&Skills>,
+    inventory: Option<&Inventory>,
+    skill: u32,
+    now: Instant,
+) -> Option<(u32, u32)> {
     let effective = match crate::ingame::linked_skill::resolve_with(skill, inventory, game) {
         crate::ingame::linked_skill::LinkedUse::Converted { skill, .. } => skill,
         _ => skill,
     };
-    let cooldown = game.and_then(|g| {
-        let skills = skills?;
-        cooldown_slot(super::cooldown::display_at(g, skills, effective, Instant::now()), start)
-    });
-    skill_slot_of(game, skill, cooldown)
+    super::cooldown::display_at(game?, skills?, effective, now)
+}
+
+/// What `X2Action:GetActionCooldownEx` answers for a skill slot: the pair the slot shows ([`action_skill_cooldown`]) and the
+/// skill's own pair without the global cooldown, both (left, total) ms.
+pub(crate) fn action_skill_cooldown_ex(
+    game: Option<&GameData>,
+    skills: Option<&Skills>,
+    inventory: Option<&Inventory>,
+    skill: u32,
+    now: Instant,
+) -> Option<((u32, u32), (u32, u32))> {
+    let effective = match crate::ingame::linked_skill::resolve_with(skill, inventory, game) {
+        crate::ingame::linked_skill::LinkedUse::Converted { skill, .. } => skill,
+        _ => skill,
+    };
+    let (game, skills) = (game?, skills?);
+    Some((
+        super::cooldown::display_at(game, skills, effective, now)?,
+        super::cooldown::own_at(game, skills, effective, now)?,
+    ))
 }
 
 pub(in crate::hud) fn skill_slot(game: Option<&GameData>, skills: Option<&Skills>, skill: u32, start: Instant) -> SlotSnap {
@@ -314,6 +356,64 @@ fn unit_race_gender(race_gender: u8) -> (u8, u8) {
     (race_gender & 0x0f, race_gender >> 4)
 }
 
+/// Native `+0x24` (`FUN_39356b60`, `x2game.dll.c:690617`): the owning character id. A character owns
+/// itself; a slave its summoner, a mate its owner, a house or shipyard the received owner. NPCs (native
+/// kind 1), transfers and ownerless units return `None`. The reason 2-6 block of `FUN_39838880` only
+/// runs when both units have a valid id, so the level protection is PvP-only.
+fn owning_character(world: &World, unit: &aa_net::model::Unit) -> Option<u32> {
+    match unit.kind {
+        UnitKind::Character { char_id } => (char_id != 0).then_some(char_id),
+        UnitKind::Slave { summoner_id, .. } => (summoner_id != 0).then_some(summoner_id),
+        UnitKind::Mate { owner_id, .. } => (owner_id != 0).then_some(owner_id),
+        UnitKind::Housing { tl_id, .. } => world
+            .get_resource::<aa_net::state::Houses>()?
+            .by_tl_id
+            .get(&tl_id)
+            .map(|h| h.snapshot.owner_id)
+            .filter(|id| *id != 0),
+        UnitKind::Shipyard { id, .. } => world
+            .get_resource::<aa_net::state::Shipyards>()?
+            .by_id
+            .get(&id)
+            .map(|s| s.kind2)
+            .filter(|id| *id != 0),
+        UnitKind::Npc { .. } | UnitKind::Transfer { .. } => None,
+    }
+}
+
+/// `FUN_39837b90` (`x2game.dll.c:1832566`): whether a zone value protects a unit of `faction`.
+/// The value is the `zones.faction_id` the HUD keeps. `DAT_39acb68c` = 5 protects every owned unit;
+/// `DAT_39acb680` = 4 protects a unit friendly to `DAT_39acb684` = 148 or `DAT_39acb688` = 149; any
+/// other value is a faction id the unit must be friendly to (`+0x4` relation state 3).
+fn zone_protects(game: Option<&GameData>, zone_faction: u32, faction: u32) -> bool {
+    match zone_faction {
+        0 => false,
+        4 => game.is_some_and(|g| g.relation(faction, 148) == "friendly" || g.relation(faction, 149) == "friendly"),
+        5 => true,
+        zone => game.is_some_and(|g| g.relation(faction, zone) == "friendly"),
+    }
+}
+
+/// `FUN_39027eb0` (`x2game.dll.c:39098`): the zone's protection value. A group with a static
+/// `conflict_zones` row (`FUN_397f2080`) is a conflict zone: `closed` means 0, and otherwise the row's
+/// `peace_protected_faction_id` applies only while the received runtime state is 7 (peace); any other
+/// state or no state means 0 (`FUN_390298d0`, `40895`). A group without a row is a home zone and uses
+/// `zones.faction_id`; the timed controller override that also returns 5 there is not modeled
+/// (capture-pending).
+fn zone_protection_value(world: &World, game: Option<&GameData>, me: &Snapshot) -> u32 {
+    if let Some((closed, peace_faction)) = game.and_then(|g| g.conflict_zones.get(&me.zone_group)).copied() {
+        if closed {
+            return 0;
+        }
+        let peace = world
+            .get_resource::<aa_net::state::ConflictZones>()
+            .and_then(|z| z.get(me.zone_group as u16))
+            .is_some_and(|s| s.state == 7);
+        return if peace { peace_faction } else { 0 };
+    }
+    me.zone_faction
+}
+
 /// Compute the panels from aa-net's state. `own_faction` is the player's faction id, `me` and `pos` the player's numbers and
 /// game position (which action bar slots are dark depends on them); also returns the game position of the target.
 pub fn refresh(world: &World, game: Option<&GameData>, own_faction: u32, own_obj_id: u32, start: Instant, me: &Snapshot, pos: Vec3) -> (Panels, Option<Vec3>, f32) {
@@ -370,9 +470,26 @@ pub fn refresh(world: &World, game: Option<&GameData>, own_faction: u32, own_obj
     }
     let mut target_pos = None;
     let mut target_radius = 0.0;
-    if let (Some(target), Some(units)) = (world.get_resource::<Target>(), world.get_resource::<Units>())
-        && let Some(u) = target.unit(units)
-    {
+    let target_obj_id = world.get_resource::<Target>().and_then(|t| t.obj_id);
+    // the local player is not in `Units` (aa-net keeps it in `Player`): targeting self resolves its
+    // own unit here, with the HUD's current points.
+    let own_target = (target_obj_id == Some(own_obj_id))
+        .then(|| {
+            let spawn = world.get_resource::<Player>()?.spawn.as_ref()?;
+            let mut unit = spawn.unit.clone();
+            unit.hp = me.hp;
+            unit.max_hp = me.max_hp;
+            unit.mp = me.mp;
+            unit.max_mp = me.max_mp;
+            unit.level = me.level;
+            unit.dead = me.dead;
+            Some(unit)
+        })
+        .flatten();
+    let picked = world
+        .get_resource::<Units>()
+        .and_then(|units| world.get_resource::<Target>()?.unit(units));
+    if let Some(u) = picked.or(own_target.as_ref()) {
         let npc = super::plates::npc_of(game, u);
         let faction = if u.faction_id != 0 { u.faction_id } else { npc.map_or(0, |n| n.faction_id as u32) };
         let (race, gender) = unit_race_gender(u.race_gender);
@@ -389,6 +506,41 @@ pub fn refresh(world: &World, game: Option<&GameData>, own_faction: u32, own_obj
         // the maxima come from the database's formulas; the highest seen is the fallback
         let unit_buffs = world.get_resource::<Buffs>().map_or(&[][..], |b| b.of(u.obj_id));
         let (max_hp, max_mp) = game.and_then(|g| super::stats::unit_max(g, u, unit_buffs)).unwrap_or((u.max_hp, u.max_mp));
+        let relation = game.map_or("neutral", |g| g.relation(own_faction, faction));
+        // 1.2 has no recovered attackability test here (`FUN_39837800` only calls the type-3 vtable's
+        // `+0x40`, whose source is not decoded): neutral units, NPC or character, stay attackable as
+        // before; only a FRIENDLY one is refused.
+        // `FUN_39838880` reasons 2-6 need both owning-character ids (`+0x24`) valid (`FUN_39356b60`):
+        // character/slave/house/mate/shipyard, never an NPC or a transfer. Reason 2 (the attacker's
+        // unresolved `+0x30` flag) is not modeled. On relation 2/3, reasons 3/4 (same owner, same party)
+        // come first and refuse as INVALID_TARGET (0x22); reasons 5/6 then use `FUN_39837a90`'s level <= 10
+        // and the zone value of `FUN_39027eb0`/`FUN_39837b90`. The native code reads each unit's own zone;
+        // the HUD has only the player's (`Snapshot::zone_faction`), so both sides use it (inferred,
+        // capture-pending). The home-zone timed controller override is not modeled (capture-pending).
+        let own_character = world
+            .get_resource::<Player>()
+            .and_then(|p| p.spawn.as_ref())
+            .map(|spawn| spawn.character().id)
+            .filter(|id| *id != 0);
+        let target_character = owning_character(world, u);
+        let both_owned = own_character.zip(target_character);
+        let same_owner = both_owned.is_some_and(|(a, b)| a == b);
+        let same_party = both_owned.is_some_and(|(a, b)| {
+            world
+                .get_resource::<aa_net::state::Party>()
+                .is_some_and(|p| p.id != 0 && p.member(a).is_some() && p.member(b).is_some())
+        });
+        let invalid_attack = relation != "hostile" && both_owned.is_some() && (same_owner || same_party);
+        let zone_value = zone_protection_value(world, game, me);
+        let zone_protected = both_owned.is_some()
+            && zone_value != 0
+            && game.is_some_and(|g| {
+                let own = me.level <= 10 && zone_protects(Some(g), zone_value, own_faction);
+                let target = u.level <= 10 && zone_protects(Some(g), zone_value, faction);
+                own || target
+            });
+        let protected_level = zone_protected && !invalid_attack;
+        let attackable = relation != "friendly" && !protected_level && !invalid_attack;
         p.target = Some(TargetSnap {
             obj_id: u.obj_id,
             npc_type: match u.kind { UnitKind::Npc { template_id, .. } => Some(template_id), _ => None },
@@ -404,22 +556,33 @@ pub fn refresh(world: &World, game: Option<&GameData>, own_faction: u32, own_obj
             unit_type,
             detail,
             faction_name: game.and_then(|g| g.factions.get(&faction).cloned()).unwrap_or_default(),
-            relation: game.map_or("neutral", |g| g.relation(own_faction, faction)),
+            relation,
+            attackable,
+            protected_level,
+            invalid_attack,
+            faction_id: i64::from(faction),
             grade: GameData::grade_name(npc.map_or(1, |n| n.grade)),
             race,
             gender,
             abilities: u.active_abilities.iter().copied().filter(|a| (1..aa_net::model::NO_ABILITY).contains(a)).collect(),
             buffs: world.get_resource::<Buffs>().map(|b| unit_buff_lists(game, b, u.obj_id, start)).unwrap_or_default(),
         });
-        target_pos = world
-            .get_resource::<crate::ingame::units::Views>()
-            .and_then(|views| {
-                let drawn = views
-                    .unit_entity(u.obj_id)
-                    .and_then(|e| crate::ingame::units::current_pose_world(world, e));
-                drawn.or_else(|| crate::ingame::units::unit_world_pose_in(u, units))
-            })
-            .map(|(pos, _)| pos);
+        target_pos = if Some(u.obj_id) == Some(own_obj_id) {
+            Some(pos)
+        } else {
+            world
+                .get_resource::<crate::ingame::units::Views>()
+                .and_then(|views| {
+                    let drawn = views
+                        .unit_entity(u.obj_id)
+                        .and_then(|e| crate::ingame::units::current_pose_world(world, e));
+                    drawn.or_else(|| {
+                        let units = world.get_resource::<Units>()?;
+                        crate::ingame::units::unit_world_pose_in(u, units)
+                    })
+                })
+                .map(|(pos, _)| pos)
+        };
         target_radius = game.map_or(0.0, |g| g.model_size(u.model_id, u.scale));
     }
     // the dark slots: what the original's `CanUseSkill` says about each (mana, range, target, state ...)
@@ -608,7 +771,12 @@ pub fn use_slot(slot: usize, env: &Env, flight: &InFlight, bar: &ActionBar, inve
             if env.held_back(skill, flight) {
                 return;
             }
-            if let Some(f) = env.precheck(skill) {
+            // a basic attack checks its target and then range-checks (`FUN_39397f90`): an out-of-range press is sent unless the
+            // `DAT_39d1fba4` setting returns 1, which then takes the click-attack path (`FUN_39393920`) without a send; the K2
+            // client sent `CSStartSkill 2` at 11.2 m, so its setting was not 1 (the default is not provable). The client's own
+            // refusal shows the same alert as any skill.
+            let refusal = if env.is_auto_attack(skill) { env.precheck_auto_attack(skill) } else { env.precheck(skill) };
+            if let Some(f) = refusal {
                 failed.write(UseFailed { skill, result: f.result, value: f.value, server: false });
                 return;
             }
@@ -670,6 +838,7 @@ pub fn action_keys(
     if let Some(slot) = script.take_slot() {
         // `take_slot` is the 0-based display cell (`slotN` in the script is 1 based).
         let page = bridge.0.borrow().action_page;
+        crate::skilltrace::press(slot + 1);
         if let Some(slot) = ActionBar::display_slot_on(page, slot) {
             let data = bridge.0.borrow();
             let env = Env::of(&data, Some(&skills), buffs.of(skills.obj_id), Some(&inventory));
@@ -705,6 +874,7 @@ pub fn action_keys(
         }
         if action == "action_bar_button" && (1..=58).contains(&slot) {
             let page = bridge.0.borrow().action_page;
+            crate::skilltrace::press(slot as usize);
             let Some(slot) = ActionBar::display_slot_on(page, slot as usize - 1) else { continue };
             let data = bridge.0.borrow();
             let env = Env::of(&data, Some(&skills), buffs.of(skills.obj_id), Some(&inventory));
@@ -751,6 +921,176 @@ mod tests {
 
     use super::*;
     use aa_net::state::NativeCooldown;
+
+    #[test]
+    fn neutral_npcs_stay_attackable_and_friendly_npcs_are_not() {
+        use aa_net::model::UnitKind;
+        use crate::hud::data::NpcInfo;
+        let mut game = GameData::default();
+        game.factions.insert(101, "Mine".into());
+        game.factions.insert(2, "Neutral".into());
+        game.npcs.insert(
+            42,
+            NpcInfo {
+                name: "Amutar".into(),
+                level: 15,
+                grade: 1,
+                kind: 14,
+                template: 9,
+                faction_id: 2,
+                show_name_tag: true,
+            },
+        );
+        game.npcs.insert(
+            43,
+            NpcInfo {
+                name: "Cocky Trainee".into(),
+                level: 32,
+                grade: 1,
+                kind: 1,
+                template: 9,
+                faction_id: 2,
+                show_name_tag: true,
+            },
+        );
+        game.npcs.insert(
+            44,
+            NpcInfo {
+                name: "Friendly Guard".into(),
+                level: 32,
+                grade: 1,
+                kind: 1,
+                template: 9,
+                faction_id: 101,
+                show_name_tag: true,
+            },
+        );
+        let mut units = Units::default();
+        for (obj_id, template, faction) in [(7, 42, 2), (8, 43, 2), (9, 44, 101)] {
+            let mut unit = crate::hud::fixture_spawn().unit;
+            unit.obj_id = obj_id;
+            unit.kind = UnitKind::Npc {
+                template_id: template,
+                owner_id: 0,
+            };
+            unit.faction_id = faction;
+            units.by_id.insert(obj_id, unit);
+        }
+        let mut app = App::new();
+        app.insert_resource(units).init_resource::<Target>().init_resource::<Buffs>();
+        let attackable = |app: &mut App, obj_id| {
+            app.world_mut().resource_mut::<Target>().obj_id = Some(obj_id);
+            let (panels, _, _) = refresh(
+                app.world(),
+                Some(&game),
+                101,
+                1,
+                Instant::now(),
+                &Snapshot::default(),
+                Vec3::ZERO,
+            );
+            panels.target.unwrap().attackable
+        };
+        assert!(attackable(&mut app, 7), "a neutral NPC (Amutar-like) is attackable");
+        assert!(attackable(&mut app, 8), "another neutral NPC is attackable");
+        assert!(!attackable(&mut app, 9), "a friendly NPC is not attackable");
+    }
+
+    /// `FUN_39838880` reasons 2-6 need both owning-character ids (`+0x24`): a character target is
+    /// protected while the attacker or the target is level 10 or below (`FUN_39837a90`) and the zone is
+    /// protected for that side's faction (`FUN_39027eb0` + `FUN_39837b90`). An NPC has no `+0x24`, so no
+    /// level protection. On neutral/friendly relation reasons 3/4 (same owner, same party) come first.
+    /// Both sides use the player's zone here (inferred).
+    #[test]
+    fn the_low_level_zone_protection_gates_owned_targets() {
+        use aa_net::conflict::ConflictZoneState;
+        use aa_net::model::UnitKind;
+        use aa_net::party::PartyMember;
+        use aa_net::state::{ConflictZones, Party};
+        let spawn = crate::hud::fixture_spawn();
+        let mut game = GameData::default();
+        for faction in [101, 102, 103, 148] {
+            game.factions.insert(faction, format!("F{faction}"));
+        }
+        game.relations.insert((101, 102), 1);
+        let mut units = Units::default();
+        let mut unit = spawn.unit.clone();
+        unit.obj_id = 7;
+        unit.kind = UnitKind::Character { char_id: 102 };
+        unit.faction_id = 102;
+        unit.level = 32;
+        units.by_id.insert(7, unit);
+        let mut app = App::new();
+        app.insert_resource(units)
+            .insert_resource(Player { spawn: Some(spawn) })
+            .init_resource::<Target>()
+            .init_resource::<Buffs>();
+        let check = |app: &mut App, game: &GameData, level: u8, zone: u32, target_level: u8, group: u32| {
+            app.world_mut().resource_mut::<Target>().obj_id = Some(7);
+            app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().level = target_level;
+            let me = Snapshot {
+                level,
+                zone_faction: zone,
+                zone_group: group,
+                ..Snapshot::default()
+            };
+            let (panels, _, _) = refresh(app.world(), Some(game), 101, 100, Instant::now(), &me, Vec3::ZERO);
+            let t = panels.target.unwrap();
+            (t.protected_level, t.attackable, t.invalid_attack)
+        };
+        // a hostile character target in a home zone: the attacker is level 10 in a zone its own faction
+        // holds (reason 5), using `zones.faction_id` because group 0 has no conflict row
+        assert_eq!(check(&mut app, &game, 10, 101, 32, 0), (true, false, false));
+        // level 11 is outside `FUN_39837a90`'s level <= 10
+        assert_eq!(check(&mut app, &game, 11, 101, 32, 0), (false, true, false));
+        // the target is level 10 in a home zone its own faction holds (reason 6)
+        assert_eq!(check(&mut app, &game, 32, 102, 10, 0), (true, false, false));
+        assert_eq!(check(&mut app, &game, 32, 102, 11, 0), (false, true, false));
+        // no zone faction and no conflict row: no protection
+        assert_eq!(check(&mut app, &game, 10, 0, 10, 0), (false, true, false));
+        // an NPC target has no owning character, so the level protection never applies to it
+        app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().kind = UnitKind::Npc { template_id: 0, owner_id: 0 };
+        assert_eq!(check(&mut app, &game, 5, 101, 1, 0), (false, true, false));
+        // a neutral character target: reason 6 still applies ...
+        app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().kind = UnitKind::Character { char_id: 103 };
+        app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().faction_id = 103;
+        assert_eq!(check(&mut app, &game, 32, 103, 10, 0), (true, false, false));
+        // ... unless the same party makes reasons 3/4 come first
+        app.insert_resource(Party {
+            id: 9,
+            members: vec![PartyMember { id: 47, ..Default::default() }, PartyMember { id: 103, ..Default::default() }],
+            ..Default::default()
+        });
+        assert_eq!(check(&mut app, &game, 32, 103, 10, 0), (false, false, true));
+        app.world_mut().resource_mut::<Party>().id = 0;
+        app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().kind = UnitKind::Character { char_id: 102 };
+        app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().faction_id = 102;
+        // a conflict group (row 14, peace_protected_faction_id 5) protects every owned unit in peace;
+        // its `zones.faction_id` is NULL, so the value comes from the row, not from the snapshot
+        game.conflict_zones.insert(14, (false, 5));
+        app.insert_resource(ConflictZones {
+            by_group: [(14, ConflictZoneState { zone_group_id: 14, state: 7, end_time: 0 })].into(),
+        });
+        assert_eq!(check(&mut app, &game, 5, 0, 32, 14), (true, false, false));
+        // any other received state, no state, and a closed row are no protection
+        app.insert_resource(ConflictZones {
+            by_group: [(14, ConflictZoneState { zone_group_id: 14, state: 6, end_time: 0 })].into(),
+        });
+        assert_eq!(check(&mut app, &game, 5, 0, 32, 14), (false, true, false));
+        app.world_mut().remove_resource::<ConflictZones>();
+        assert_eq!(check(&mut app, &game, 5, 0, 32, 14), (false, true, false));
+        game.conflict_zones.insert(14, (true, 5));
+        app.insert_resource(ConflictZones {
+            by_group: [(14, ConflictZoneState { zone_group_id: 14, state: 7, end_time: 0 })].into(),
+        });
+        assert_eq!(check(&mut app, &game, 5, 0, 32, 14), (false, true, false));
+        game.conflict_zones.insert(14, (false, 5));
+        // a home zone still uses `zones.faction_id`; sentinel 5 protects every owned unit and 4 one
+        // friendly to faction 148/149
+        assert_eq!(check(&mut app, &game, 10, 5, 32, 0), (true, false, false));
+        app.world_mut().resource_mut::<Units>().by_id.get_mut(&7).unwrap().faction_id = 148;
+        assert_eq!(check(&mut app, &game, 32, 4, 10, 0), (true, false, false));
+    }
 
     #[test]
     fn action_bar_page_keys_rotate_the_four_pages() {
@@ -945,8 +1285,9 @@ mod tests {
         skills.native_tag_cooldowns[0].cooldown.total_ms = 0;
         assert_eq!(skill_slot(Some(&game), Some(&skills), 7, start).cooldown.map(|(_, total)| total), Some(0));
 
-        // A longer observed cast still wins, with its own DB duration, as before.
-        skills.last_used.insert(7, Instant::now());
+        // A longer observed cast still wins, with its own DB duration, when the received timer is older than the cast's answer
+        // (here 3 s before it); a timer that came with the cast would be its answer and show instead (`cooldown::observed_at`).
+        skills.last_used.insert(7, start + std::time::Duration::from_secs(3));
         assert_eq!(skill_slot(Some(&game), Some(&skills), 7, start).cooldown.map(|(_, total)| total), Some(10_000));
         skills.last_used.clear();
         skills.native_tag_cooldowns[0].reset = true;

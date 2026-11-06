@@ -157,6 +157,12 @@ pub struct HudData {
     pub death_started: std::cell::Cell<Option<u64>>,
     /// The server offered an in-place resurrection (the caster may be the player below level 10).
     pub revive_caster: std::cell::Cell<Option<u32>>,
+    /// When `CSResurrectCharacter` was last sent for this death (HUD clock, ms). `FUN_39186e70`
+    /// debounces 2 s, which still let the countdown and a click send twice, so the HUD holds
+    /// further requests until the death ends, a new death or offer arrives, or
+    /// [`RESURRECT_RETRY_MS`] passes without `SCUnitResurrected` (a refused or lost request must
+    /// not leave the player dead with a dead button; the retry bound is ours, not 1.2's).
+    pub death_requested: std::cell::Cell<Option<u64>>,
     /// The offered caster's name, for `X2Unit:GetUnitNameById` in the death window
     /// (`PLAYER_RESURRECTION`), which may name a unit outside the player's target or party.
     pub revive_caster_name: std::cell::RefCell<Option<String>>,
@@ -188,6 +194,10 @@ pub struct HudData {
     pub(super) look_conversion: super::look_conversion::View,
     pub party_pushed: Option<aa_net::Party>,
     pub character_id: u32,
+    /// The logged-in account (`Worlds.account`), for `doodad_func_permission` 6.
+    pub account_id: u32,
+    /// The account's character ids (`Characters.list`), for `doodad_func_permission` 6.
+    pub account_characters: Vec<u32>,
     pub store: super::store::View,
     pub(super) specialty: super::specialty::View,
 }
@@ -244,6 +254,7 @@ impl Default for HudData {
             death_ends: Default::default(),
             death_started: Default::default(),
             revive_caster: Default::default(),
+            death_requested: Default::default(),
             revive_caster_name: Default::default(),
             tips: Default::default(),
             stats_pushed: 0,
@@ -269,6 +280,8 @@ impl Default for HudData {
             look_conversion: Default::default(),
             party_pushed: None,
             character_id: 0,
+            account_id: 0,
+            account_characters: Vec::new(),
             store: Default::default(),
             specialty: Default::default(),
         }
@@ -296,6 +309,9 @@ const FAKE_INGAME: [(&str, &str); 8] = [
     ("fake_target.lua", include_str!("../../../aa-ui/examples/fake/fake_target.lua")),
 ];
 const INGAME_LUA: &str = include_str!("ingame.lua");
+/// How long a sent resurrect request holds further ones without `SCUnitResurrected` (ours, not
+/// 1.2's: the native only debounces 2 s).
+pub(super) const RESURRECT_RETRY_MS: u64 = 10_000;
 /// Where the road map images sit in the roadmap window (generated from the client's `map/road_map_list.lua`).
 const ROAD_FRAMES_LUA: &str = include_str!("road_frames.lua");
 
@@ -375,6 +391,7 @@ pub fn install(rt: &mut UiRuntime, bridge: &Shared) -> mlua::Result<()> {
     super::mail::install(lua, bridge)?;
     super::auction::install(lua, bridge)?;
     super::housing::install(lua, bridge)?;
+    super::farm::install(lua, bridge)?;
     super::itemlinks::install(lua, bridge)?;
     super::item_effects::install(lua, bridge)?;
     super::enchant::install(lua, bridge)?;
@@ -841,14 +858,37 @@ pub fn refresh_snapshot(world: &mut World, bridge: &Shared) {
     super::pvp::refresh(world, &mut data, &spawn);
     super::radar::refresh(world, &mut data, &spawn);
     data.character_id = spawn.character().id;
+    data.account_id = world
+        .get_resource::<aa_net::state::Worlds>()
+        .and_then(|w| w.account)
+        .map_or(0, |a| a.account_id);
+    if let Some(chars) = world.get_resource::<aa_net::state::Characters>() {
+        let same = data.account_characters.len() == chars.list.len()
+            && data.account_characters.iter().zip(&chars.list).all(|(id, c)| *id == c.id);
+        if !same {
+            data.account_characters = chars.list.iter().map(|c| c.id).collect();
+        }
+    }
     super::battlefield::refresh(world, &mut data, &spawn);
     super::expansion::refresh(world, &mut data);
     super::repair::refresh(world, &mut data);
+    if let Some(game) = data.game.get() {
+        if let Some(mut received) = world.get_resource_mut::<aa_net::Actabilities>() {
+            if received.up_limits != game.crafting.raw_limits {
+                received.up_limits.clone_from(&game.crafting.raw_limits);
+            }
+        }
+    }
     super::crafting::refresh(world, &mut data);
     super::pets::refresh(world, &mut data);
     data.mounted.local_cart = world
         .get_resource::<crate::ingame::cart::CartDrive>()
-        .and_then(crate::ingame::cart::CartDrive::speed);
+        .and_then(crate::ingame::cart::CartDrive::motion)
+        .map(|(obj_id, speed, turn_rate)| super::mounted::LocalCart {
+            obj_id,
+            speed,
+            turn_rate,
+        });
     if let Some(party) = world.get_resource::<aa_net::Party>() {
         if data.party != *party { data.party.clone_from(party); }
     }
@@ -1049,7 +1089,7 @@ pub fn handle_requests(
     credentials: Option<Res<crate::ingame::enter::Credentials>>,
     mut bar: ResMut<aa_net::state::ActionBar>,
     inventory: Res<aa_net::state::Inventory>,
-    target: Res<aa_net::state::Target>,
+    mut target: ResMut<aa_net::state::Target>,
     skills: Res<aa_net::state::Skills>,
     buffs: Res<aa_net::state::Buffs>,
     mut flight: ResMut<super::usable::InFlight>,
@@ -1069,7 +1109,14 @@ pub fn handle_requests(
             }
             Request::Party(command) => { net.write(NetCommand(Command::Party(command))); }
             Request::Friend(command) => { net.write(NetCommand(Command::Friend(command))); }
-            Request::Target { obj_id } => { net.write(NetCommand(Command::Target { obj_id })); }
+            Request::Target { obj_id } => {
+                // The native `ChangeTargetForUI` sets its local target before the send and sends only
+                // on a change (the server's `SCTargetChanged` confirms it); the own portrait's
+                // `X2Unit:TargetUnit('player')` comes here.
+                if target.set_local((obj_id != 0).then_some(obj_id)) {
+                    net.write(NetCommand(Command::Target { obj_id }));
+                }
+            }
             Request::Slave(command) => {
                 // The driver's leave: the capture's last type-4 0/0 goes out just before CSDiscardSlave.
                 if let aa_net::slave_control::SlaveCommand::Unbind { tl_id } = &command
@@ -1209,7 +1256,24 @@ pub fn handle_requests(
                 panels::use_bag_slot(slot - 1, &env, &flight, &inventory, &target, &mut pressed, &mut failed);
             }
             Request::Resurrect { in_place } => {
-                net.write(NetCommand(Command::Resurrect { in_place }));
+                // `FUN_39186e70` (`X2Player:Resurrect`): the native sends only while the death
+                // timestamp is set and the server's resurrect wait has run out; an in-place
+                // revival also needs the offer. It debounces 2 s, which still allowed the
+                // countdown and a click to send twice: latch one request per death.
+                let data = bridge.0.borrow();
+                let now = panels::now_ms(data.start);
+                let dead = data.death_started.get().is_some();
+                let wait_over = data.death_ends.get().is_some_and(|end| now >= end);
+                let allowed = !in_place || data.revive_caster.get().is_some();
+                let held = data
+                    .death_requested
+                    .get()
+                    .is_some_and(|sent| now < sent + RESURRECT_RETRY_MS);
+                if dead && wait_over && allowed && !held {
+                    data.death_requested.set(Some(now));
+                    drop(data);
+                    net.write(NetCommand(Command::Resurrect { in_place }));
+                }
             }
             Request::LearnSkill { id } => super::skillbook::learn_skill(&bridge.0.borrow(), id, &mut net),
             Request::LearnBuff { id } => super::skillbook::learn_buff(&bridge.0.borrow(), id, &mut net),
@@ -1244,11 +1308,25 @@ pub fn mark_pushed(bridge: &Shared) {
 
 /// Push what changed into the Lua state and raise the events the scripts listen for.
 pub fn push_changes(rt: &UiRuntime, bridge: &Shared) {
-    super::mode_actions::push_slots(rt, bridge);
-    super::pets::push(rt, bridge);
-    push_state(rt, bridge);
+    use aa_cry::prof::scope;
+    {
+        let _t = scope("hud.push.mode_slots");
+        super::mode_actions::push_slots(rt, bridge);
+    }
+    {
+        let _t = scope("hud.push.pets");
+        super::pets::push(rt, bridge);
+    }
+    {
+        let _t = scope("hud.push.state");
+        push_state(rt, bridge);
+    }
     // after the state: the character window's handler reads HUD.state (level, ...)
-    push_character_stats(rt, bridge);
+    {
+        let _t = scope("hud.push.stats");
+        push_character_stats(rt, bridge);
+    }
+    let _t = scope("hud.push.panels");
     push_panels(rt, bridge);
 }
 
@@ -1294,6 +1372,7 @@ fn push_panels(rt: &UiRuntime, bridge: &Shared) {
     }
     let lua = &rt.lua;
     let Ok(hud) = lua.globals().raw_get::<Table>("HUD") else { return };
+    let push_timer = aa_cry::prof::scope("hud.panels.push");
     let changed = match panels::push(lua, &hud, &new, Some(&old)) {
         Ok(c) => c,
         Err(e) => {
@@ -1301,11 +1380,15 @@ fn push_panels(rt: &UiRuntime, bridge: &Shared) {
             return;
         }
     };
+    drop(push_timer);
+    let slots_timer = aa_cry::prof::scope("hud.panels.refresh_slots");
     if changed.slots
         && let Err(e) = rt.refresh_slots()
     {
         warn!("hud: refresh slots: {e}");
     }
+    drop(slots_timer);
+    let _target_timer = aa_cry::prof::scope("hud.panels.target_events");
     if changed.bank {
         rt.fire_event("BANK_UPDATE", (-1i64, -1i64));
     }
@@ -1337,10 +1420,13 @@ fn push_state(rt: &UiRuntime, bridge: &Shared) {
     let Some(old) = old else { return };
     let lua = &rt.lua;
     let Ok(hud) = lua.globals().raw_get::<Table>("HUD") else { return };
+    let snapshot_timer = aa_cry::prof::scope("hud.state.snapshot");
     if let Err(e) = push_snapshot(lua, &hud, &new) {
         warn!("hud: state: {e}");
         return;
     }
+    drop(snapshot_timer);
+    let _events_timer = aa_cry::prof::scope("hud.state.events");
     let script_id = super::unit_id::from_private(&new.unit_id).unwrap_or_default();
     let id = script_id.as_str();
     if (old.hp, old.max_hp) != (new.hp, new.max_hp) {

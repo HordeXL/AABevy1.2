@@ -9,7 +9,7 @@ Code:
 | `crates/aa-client/src/ingame/doodad_affordance.rs` | the use-target ring under the doodad the bar is about (`use_target_decal`) |
 | `crates/aa-client/examples/doodad_affordance.rs` | the unattended check of the ring, the bar and the plate (see "Seeing it") |
 | `crates/aa-net/src/interaction.rs` | `Interact::NaviTeleport` / `NaviOpenPortal` (`CSNaviTeleport` 0x0e7, `CSNaviOpenPortal` 0x0e8, `bc doodadObjId`) |
-| `crates/aa-net/src/session.rs` | `SCNaviTeleport` (0x15c, decoded in `portal.rs`) -> `CSTeleportEnded` + `Event::Teleported { yaw: 0, reason: 0 }` |
+| `crates/aa-net/src/session.rs` | `SCNaviTeleport` (0x15c, decoded in `portal.rs`) -> `Event::Teleported { yaw: 0, reason: 0 }` (the app answers `CSTeleportEnded` after the load, like `SCTeleportUnit`) |
 | `crates/aa-client/src/ingame/combat.rs` | a skill aimed at a doodad is aimed at the doodad's position (the player turns to it) |
 | `crates/aa-client/src/hud/combat.rs` | a cast at a doodad does not start the fight ("Battle Start!" only for unit targets) |
 
@@ -25,8 +25,8 @@ what the doodad's **current phase** (`func_group_id` of `SCDoodad(s)Created`, up
   `dynamic_action_bar.lua` hides them).
 * `DoodadFuncNaviTeleport` / `DoodadFuncNaviOpenPortal` without a skill: `CSNaviTeleport` / `CSNaviOpenPortal`. The answer to a
   teleport is `SCNaviTeleport` (a position); like the 1.2 client (`OnNaviTeleport` runs the `SCTeleportUnit` routine with reason 0,
-  yaw 0) aa-net answers `CSTeleportEnded` and emits `Teleported`, so `player::follow_server` and the long-jump loading screen
-  (`ingame::teleport`) handle it.
+  yaw 0) aa-net emits `Teleported`, so `player::follow_server` and the long-jump loading screen (`ingame::teleport`) handle it;
+  that module sends `CSTeleportEnded` when the destination is loaded.
 
 `hud/doodad.rs` loads `doodad_funcs` once (`Tables`, in the HUD's `GameData`) as phase -> skills / navi uses, plus the English
 doodad names (`localized_texts` of `doodad_almighties`).
@@ -40,11 +40,15 @@ doodad names (`localized_texts` of `doodad_almighties`).
   `ExecuteDynamicAction(i)` (a click), `X2Interaction:GetInteractionSkillIconPath(skill)` (the skill icon,
   `ui/icon/interaction/icon_interaction29.dds` for 14602; the script derives `_o` / `_c` / `_d`) and `IsValidIconPath` (pak lookup).
 * **Which doodad**: the one last right clicked while it is in reach, else the nearest, a doodad behind the player counting up to 3 m
-  further than one in front (an inn's chairs stand around the Crescent Throne tome). Reach: the skill's `max_range` (at least 2 m),
-  4 m without a skill. The 2026-10-30 1.2 capture: the herb's Gather (13990, `max_range` 4) is on the bar at 3.0 m and absent at
-  4.5 m and 8.0 m (F sent nothing), so there is no slack on top of the range (the first version added 1 m). The edge between 3.0
-  and 4.5 m and the reach of other doodad skills were not sampled; every doodad skill uses the same rule, unverified beyond Gather.
-  The range is measured to the doodad's origin; the 2 m minimum and the 4 m default are ours, not captured.
+  further than one in front (an inn's chairs stand around the Crescent Throne tome). Reach: the client setting
+  `max_interaction_doodad_distance` that `FUN_3902f010` reads (`DAT_39aefb98+0x2a0`), not the skill's `max_range`. The setting's
+  value is not in the pak; the 2026-10-30 1.2 capture bounds it: the herb's Gather (13990, `max_range` 4) is on the bar at 3.0 m
+  and absent at 4.5 m and 8.0 m (F sent nothing), so the port uses 4.0 m with no slack. It is the same distance for every doodad
+  skill: storage skill 15307 has `max_range` 20 but its "store a trade pack" button must clear at the same 4 m (2026-11-01 retest:
+  the icon stayed on screen 10 m from the box). The threshold is the **centre distance** to the doodad's origin (strictly
+  under 4 m), as the capture's 3 m/4.5 m boundary supports; the player's radius only feeds the ordering key. The setting's
+  binary default is 2.0999999 m as a surface gap to the doodad's shape (see "Walk-to" below, which uses it for the right-click
+  use); how the bar's capture-bounded 4 m centre distance relates to it is not resolved.
 * **Keys**: F (G, H, J for the 2nd to 4th button) uses the doodad when no loot is in reach (F loots first, `loot.rs`) and no NPC
   is nearer than the doodad (F talks, `dialog.rs` asks `View::claims_key`).
 * **Right click** on a doodad (view ray against a sphere at the doodad, 1.3 m * scale, within 40 m; an NPC in front of it wins):
@@ -57,6 +61,81 @@ doodad names (`localized_texts` of `doodad_almighties`).
 * **The result** comes as server state: the Memory Tome's `SCCharacterReturnDistricts` updates `Portals` (aa-net) and the Teleport
   Book's Default Site moves its recall marker to the new point; `SCDoodadPhaseChanged` moves the tome to its timer phase (no skill
   use: the bar goes to the next doodad or hides) and back after a few seconds.
+
+## Workbenches (craft benches)
+
+A `DoodadFuncCraftStart` or `DoodadFuncCraftPack` phase has no `func_skill_id` (1.2: 18 + 7
+CraftStart rows with NULL/0 and all 304 CraftPack rows NULL). It is still a use: native
+`393bd290` adds the craft action to the shared action list, and selecting it calls
+`393b7ba0` -> `394dc360`, which installs interaction kind 3 and fires event 0x78
+`CRAFTING_START(objectID, uniqueRecipeCount)` for `crafting_renewal.alb`. The open is local:
+`394dc360` sends no packet. `394dc210` builds CURRENT from every static template function
+group, taking `DoodadFuncCraftStart` (kind 0x0c) recipe lists and `DoodadFuncCraftPack`
+(kind 0x3a) pack membership, deduplicated and grouped by the recipe's `ac_id`. That is the
+same union `crafting/data.rs` loads into `benches` by `doodad_almighties.id`.
+
+The port adds that action to the phase's `Uses` (`craft: Vec<perm_id>`, one entry per craft
+func), offers it on F, the right-click list and the dynamic bar (a sentinel id, since no
+skill exists), and `doodad::execute` opens the bench through `crafting::open_bench`, firing
+`CRAFTING_START` with the two numeric arguments the script's `SetDoodad` reads. No packet
+goes out on open. Opening a bench runs native `FUN_393b7b10`'s `FUN_393b7aa0` first whenever any
+interaction is active (another bench, a shown doodad interaction list or the coffer
+window), so the HUD fires `INTERACTION_END` before `CRAFTING_START`; an open coffer is
+also closed through `CSCofferInteraction` on the next frame.
+
+The bar and right-click list use the normal doodad candidate distance (4 m): native
+`393bd290` does not range-filter the craft action. On use, `FUN_393b3ec0` checks
+`FUN_39093800` against `max_interaction_doodad_distance` (2.1 m surface gap) for every
+action, skills included; out of range it walks to the doodad (`FUN_390a6af0` pending
+action) and runs the action on arrival. That walk needs a gap measured against the drawn
+model's bounds (the native predicate uses the real colliders): when only the `sim_radius`
+fallback is available (the model is not built yet, a parented doodad on a wagon or ship,
+or a template whose `sim_radius` is 0), the port does not walk — the use is sent or the
+bench opened at once and the server checks the reach. A walk that stops with no progress
+(the character has not got nearer for 3 s) runs the pending use when the gap was that
+fallback and otherwise answers `FUN_39428370(0x9a)` `TOO_FAR_AWAY`. A phase that also
+offers a skill or navi use therefore walks before its list is offered, while a craft-only
+phase is listed from the 4 m centre distance. The pending action stores the phase and view
+generation it was picked from; on arrival the port re-checks the phase, the generation and
+a craft permission and drops the use if any changed, and a different bar or list pick
+cancels it. A fresh pointer click also cancels it when it arrives on the same frame as the old walk. Picking a list entry closes the list (`menu_shown`), so a later bench open does
+not close it a second time. `FUN_394d6dc0`
+rechecks the same distance before `CSExecuteCraft` (`batch::command`) and shows error 0x9a
+(`TOO_FAR_AWAY`) when the request is out of range. The active-interaction monitor `393b7e40`
+closes through `393b7aa0` (`INTERACTION_END`) when the doodad is gone or out of range
+(`batch::update`, which keeps CURRENT maps until the next bench, as `393b7aa0` does).
+`X2Craft:EndCraftingInteraction` (wrapper `39460890`) queues the same close.
+
+Permission is `FUN_393b3300`, checked per craft func (`doodad_funcs.perm_id`):
+0 any; 1 owner; 2 owner or friend; 3 expedition (the player must be in one; a doodad with
+faction 0 is open to it, else `SCDoodadOriginator.new_faction`, native doodad+0x350, must be
+the player's expedition id); 4 owner or the same five-person party group; 5 owner or any
+party/raid member; 6 the owner, or the doodad's house is the player's account (native
+`FUN_393b32c0`: `owner == me`, or the house's `+0xa8` is my account; an alt of the login
+character list is *not* enough);
+7 the zone group's received Dominion owner expedition belongs to the player's nation
+(native `FUN_393b3300` case 7 -> `FUN_39053360(zoneGroup, DAT_39d44b94, 0)`: the owner
+resolved through the received expedition records and the static `system_factions`
+`mother_id` chain, as `FUN_392f8180` does, must be the player's CharacterState faction); an unknown zone, Dominion row, owner or faction
+record is refused (native has no record to compare); 8 the account has a house in the
+doodad's zone group (native `FUN_3932aaf0` walks the own house list `DAT_3a167ec4`, kept
+here from `SCMyHouse`/`SCLoginCharInfoHouse` so it survives the house leaving view); unknown
+values are refused. The owner is the house owner for a housing doodad. A house zone the
+client cannot resolve yet is inferred as allowed and the server's `bench_denial` stays
+authoritative. The send carries the live bench object id
+(`CSExecuteCraft` 0x0f8: recipe, doodad, count).
+
+## Quest hand-in
+
+A doodad's quest function can also take a quest in: the server sends `SCDoodadCompleteQuest` 0x14d (`bc`
+doodad, `u32` quest; x2game `FUN_391dc050` -> `FUN_393773a0`). `hud/dialog.rs` raises the original's
+`COMPLETE_QUEST_CONTEXT_DOODAD(quest, flag, doodadId)`, where the flag is `FUN_397d42d0` of the Ready
+component (act type 0x14 `QuestActConReportNpc` or 0x15 `QuestActConReportDoodad`). With the flag the
+directing window opens and its confirm button sends from the doodad id kept in `d.dialog`; without it the
+quest context script calls `TryCompleteQuestContext(2, quest, doodadId, "", selected)` immediately. The
+`CSCompleteQuestContext` request then carries that doodad object id (or 0x0dd for an in-progress
+let-it-done quest). The lane server does not send 0x14d yet, so the path is tested against the real World
+scripts from the decoded packet, not live.
 
 ## Natural gathering
 
@@ -282,8 +361,14 @@ silhouette pass; the game's native silhouette path is `Prefab::SetSilhouetteColo
 ## Walk-to, plate and phase messages
 
 A right click on a doodad out of reach starts `View::approach`: the character runs at it (camera turned, W held) until
-`stop_distance(reach)`, then the use is sent. A key of the player's, a missing doodad or [`STUCK_SECS`] without getting
-0.3 m nearer ends the walk; the state machine (`advance`) is pure and unit tested. The plate is the original
+the **interaction gap** is inside `max_interaction_doodad_distance` (2.0999999 m, `x2game` config `+0x2a0`,
+`FUN_39093800`, a 3D surface gap against the doodad's shape; this port measures to the drawn model's
+combined LOD 0 bounds in the doodad's own rotated frame (an axis-aligned world box was too lenient on rotated
+models); a phase change swaps the bounds only when the new model is built, a same-model phase keeps them,
+falling back to `doodad_almighties.sim_radius` while the model is not ready and for parented doodads), then
+the use is sent. The skill's own `max_range` is only the dynamic action bar's reach, not the right-click use range:
+a 100 m doodad skill clicked at 3 m walks first (2026-11-01). A key of the player's, a missing doodad or
+[`STUCK_SECS`] without getting 0.3 m nearer ends the walk; the state machine (`advance`) is pure and unit tested. The plate is the original
 `DRAW_DOODAD_TOOLTIP`: name, `owner` while the doodad has one (`SCDoodadCreated`/`SCDoodadOriginator`), and
 `displayTime` = the growth seconds left
 (rounded up) from `DoodadVisual::remaining_ms`. `SCDoodadPhaseMsg` (0x157, bc object id + i32 message id) is decoded

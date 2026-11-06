@@ -1,5 +1,30 @@
 # ArcheAge 1.2 feature parity
 
+## Combat stance and auto-attack checkpoint, 2026-11-01
+
+The 1.2 decompile settles the combat state; the K2 capture (2026-11-01-combat-k2k3) only supplies the client's outbound packets.
+The battle flag is the `X2Unit + 0x3bba` byte: `OnCombatEngaged` sets it (`FUN_391d69a0` -> `FUN_390b36f0`), a real blow sets
+it on both sides (`FUN_39391670`: a caster, a hit, both units alive), and a blow on the local player's own mate also sets it on
+the local owner (the target's `+0x410 == 5`, `+0x420` the local character id, the owner alive), and `OnCombatCleared` clears it
+at once (`FUN_391d6a60` ->
+vtable `+0x48` -> `FUN_39355ec0` -> `FUN_390b3710`); a clear on a unit that is not flagged changes nothing. The capture's
+1 -> 0 at t=59,322 is our server's `SCCombatCleared` 0.772 s after the recorder lost the target (0.613 s after the no-target
+press), not a client timer. Separate from the flag is the derived combat idle (`combat.rs` `CombatIdle`, `X2Unit + 0x5fc4`):
+`FUN_39355ee0` refreshes `+0x5fc0` every update while the flag is set and for 1000 ms after the local player's auto attack
+request (skill 2; the `+0x158` branch for another skill is unreachable in 1.2), and the idle falls `DAT_39ac7424` =
+10000 ms after the last refresh (the model's `+0x428`); the deadline does not clear the flag and does not put the weapon away.
+Putting the weapon away zeroes `+0x5fc0` (`FUN_39360920`), as does the resurrect reset (`FUN_39362690`), so the idle ends with
+the weapon. The weapon byte `+0x3ba8` stayed 1 after the K2 clear, so the **drawn weapon** (`Drawn`) remains a separate state
+(Bevy's 10 s auto-sheathe is inferred; the capture shows no sheathe). The combat idle with no weapon in the hand is the fist
+one. The K2 client sent another `CSStartSkill 2` on the re-press and at 11.2 m: there is no local toggle, no stop-on-walk and
+no local swing timer, and the first clip and 2 s cadence were our server's `SCSkillFired` timing (CONT). The client's only
+swallow is the auto attack latch `+0x3ad5` (`FUN_393989e0`), set by an `SCSkillStarted` for skill 2 with timeline 0 and
+cleared by `SCSkillStopped` (`FUN_39398410`); our server sends none for skill 2, so every K2 press went out. Out of range is a
+range check (`FUN_39397f90`) whose send depends on the `DAT_39d1fba4` setting; the K2 client sent at 11.2 m, so its setting was
+not 1 (the default is not provable). The GCD exemption (K2 pair 0/1000) is **inferred**, not decompile-proven, and the
+white/yellow combat text split follows the same inferred basic ids (2, 3, 4), not `weapon_slot_for_autoattack_id`. Open: the
+client's own sheathe after a fight is not recovered.
+
 ## Vehicle interaction, engine and cinema checkpoint, 2026-11-01
 
 The 1.2 mode bar is filled natively (`FUN_39204500` / `FUN_392045f0`), not by Lua. The 2026-11-01
@@ -146,15 +171,17 @@ without an attached list counts at point 1 only, a row with one only at its FIRS
 driver branch is the SCSlaveBound master (`this+0x14` timeline, `+0x18` object id): both the speed
 check and the packet use that BOUND slave, refusing above `_DAT_3999f85c` 25.0 (5 m/s) with 0x67;
 the passenger branch is `FUN_39362170`'s no-speed path throttled at `_DAT_3a169948` 1500 ms (a
-point-1 seat without the master stays silent). The dynamic action bar gets a slave candidate from
+point-1 seat without the master stays silent); the explicit dismount skill is the only passenger
+leave; movement keys keep the seat (2026-11-02 12:30 real 1.2 capture: W sent nothing, the R skill unbound; the decompile input path must be blocked for passengers by an unresolved guard). The dynamic action bar gets a slave candidate from
 `FUN_393bbb80`: reach `_DAT_399d3230` 6.25 -> 2.5 m surface gap and the native key
 `gap - (1 + facing)`, one sorted unit/doodad set (`FUN_3902ed20`), so the doodad producer is
 arbitrated on the same key (the wagon beats its nearer rear storage box). A right-clicked doodad is
 preferred only among doodads; a tie keeps the doodad (`FUN_393bd9e0`, not decoded). There is no
 prompt for the slave already bound/sat on, while riding a mate, or while sitting on a bonded seat
 doodad (`player+0x3b94`). F sends `CSBindSlave` 0x031 for 12076, or 13863 when `model_bindings` has
-a free point 2. The stock Summon Info window opens from `SHOW_SLAVE_INFO` and shows the received
-header/equipment; the vehicle-gear and speed getters stay stubs (listed in
+a free point 2. The stock Summon Info window opens from `SHOW_SLAVE_INFO`; its Type and
+Classification rows read the received slave template, and its Move Speed and Turn Speed rows
+read the seated slave's live motion (`FUN_394aabd0` / `FUN_394aae90`, listed in
 [HUD](aa-client-hud.md)). Unit, click and producer tests are in `hud/mode_actions/tests.rs`,
 `hud/slave/tests.rs` and the inline tests in `hud/doodad.rs`; the `vehicle_bar` example shows the
 7-slot bar and the F prompt in one frame, measured from the driven wagon. Open: the two
@@ -259,8 +286,13 @@ Merged:
 - **#33 cart boarding.** A right-click sends `CSChangeTarget` 0x02c when needed and `CSStartInteraction` 0x068; the
   server's first 0x07b skill 12076 binds through the 3.0 m (3.5 m mounted) surface gap and 4.0 m bind check with
   `CSBindSlave` 0x031, and leaving sends `CSDiscardSlave` 0x032. The capture and replay match the chain at
-  2.0/2.9/3.1 m and the leave (`tools/evidence/cart_boarding/`); the 3.5/4.5 m native picks never landed. Open:
-  auto-walk, passenger 13863 and destroy 19165, per-collider shapes, the dynamic action bar/F, and player flags.
+  2.0/2.9/3.1 m and the leave (`tools/evidence/cart_boarding/`); the 3.5/4.5 m native picks never landed.
+  The driver's 5 m/s 0x67 refusal is gated on the native model's +0x2a0 slot: the
+  `vehicle_models.use_wheeled_vehicle_simulation` flag for a vehicle, or a `ShipModel`'s 0x198-byte ship object
+  pointer (`FUN_390bdf70`, inferred and capture-pending). The 2026-11-01 owner capture left the Red Farm Hauler
+  (slave template 146) at ~6.7 m/s with W held and no 0x67, while the speed-car models carry the flag. Open: a
+  live car leave, a ship leave above 5 m/s, auto-walk, passenger 13863 and destroy 19165, per-collider shapes,
+  the dynamic action bar/F, and player flags.
 - **#34 mount animations.** Mount reason 1-4 selects the left/right/behind/front get-on, riding uses the idle/walk/run
   bands with the idle-to-run one-shots, and dismount plays `fist_ac_horse_l_getoff_start`/`_loop`/`_end`;
   `SCUnitAttached`'s reason byte is kept for remote riders. The capture supplies the reasons and timing, the clips come
@@ -375,13 +407,21 @@ and the walk to the mount before mounting is in the mount-walk checkpoint above.
   `SCUnitDeath` drive `vehicle::update_damage`, which reads the new body on the workers and swaps the
   parts, wheels, spindle and `$` helpers only when it is ready (resetting the turret bone cache), spawns
   the new prefab's active damage fire/smoke, and on a worsening state plays its `_spawn_effect*` particles
-  once (`FUN_39109120`). Dying prefabs that wrap a `.cdf` are drawn as rigged creature models. Dead hulls
-  render: `aa-cry` keeps meshes under a plain-named helper container in LOD 0 (the `*_dead.cgf` files; a
-  pak sweep changed 133 of 31 636 geometry files with no double geometry). Covered by
-  `examples/vehicle_damage`, the threshold/max-HP/variant/dying/swap/turret unit tests and the `aa-cry`
-  dead-hull test.
+  once (`FUN_39109120`). Dying prefabs that wrap a `.cdf` are drawn as rigged creature models, and the
+  prefab's authored `Animation`/`bPlaying` starts (`Part::animation`, `FUN_39109d20`); the Red Farm Hauler's
+  `dead_01` is the captured tip/roll (2026-11-02, video 41-43.5). There is no client wreck timer:
+  `SCSlaveRemoved` only clears the owned timeline, and the wreck stays until `SCUnitsRemoved` (the raw
+  frames still show the Hauler at video 60 s, 2026-11-02). Dead hulls render: `aa-cry` keeps meshes under a
+  plain-named helper container in LOD 0 (the `*_dead.cgf` files; a pak sweep changed 133 of 31 636
+  geometry files with no double geometry). The Eznan Cutter's hp repair/debris doodads are drawn from the
+  server's `SCDoodadCreated`; ship death has no explosion (`galleon.dead` names only the water-destroy
+  burst), keeps the damaged prefab's fire burning and lists/sinks over 12 s (`WreckSink`, capture-inferred
+  mechanism; the ship update has no sink function and the server stops its physics); a wreck announced already
+  dead starts at the end pose (inferred). Covered by
+  `examples/vehicle_damage`, `examples/vehicle_ship_death`, the threshold/max-HP/variant/dying/swap/turret,
+  authored-animation, ship-death/sink and wreck-lifetime unit tests, and the `aa-cry` dead-hull test.
 
-Still open across these slices: hanging (S13), the speed-driven exhaust / splash scales and the engine sound of S15,
+Still open across these slices: the speed-driven exhaust / splash scales and the engine sound of S15,
 auto-walk, mount jump clips, larger ships, and the copper boiler colour; remote vehicle smoothing (S8) and gliders
 (S14) landed with their own captures, and the walk to the mount before mounting is in the mount-walk checkpoint above. The detailed pending checks are in
 
@@ -389,11 +429,22 @@ auto-walk, mount jump clips, larger ships, and the copper boiler colour; remote 
   (kind 1/6 ladder, 2 rope, 3 wood, 4 net, 5 horizontal rope, 7 mast, 8 guardrail, 9 45-degree ladder,
   10 tree) and whose model has an exact `$ladder` helper; the climb segment is the box of the mesh chunk
   that helper names (`FUN_393aaad0`), not the whole model. F grabs the nearest one within the 1.5 m use
-  reach and the body is placed before the server answers (`CSHang` 0x0cb). The grab is refused on a
-  seat, glider or skill move and while the unit is BOUND to a vehicle (`+0x3af0`, its seat `+0x3af4`,
-  `FUN_393b8f40`); a deck walker sends its own moves with `+0x3af0` null, so a deck does not refuse it,
-  and water does not either (there is no swim gate in `FUN_393630e0`); only a grab the gates accept
-  claims F over NPC talk and loot-all. W/S climb with the clip's root speed scaled by the buffs'
+  reach and the body is placed before the server answers (`CSHang` 0x0cb). A right click on a ladder
+  is taken as the same use-target grab: inferred, since `FUN_393b8f40` is the only `CSHang` sender
+  found but there is no right-click-on-ladder capture. The owner's real 1.2 client grabbed a ship
+  ladder while walking toward it (2026-11-01 ~13:45, `CSHang` on the doodad); a contact-trigger path
+  was not found in the decompile, so proximity grab is not implemented. The fixed-frame kinds
+  (1/4/5/8/9) stand on the `$ladder` helper's front (+Y) side in the doodad's world frame, so a
+  ladder parented to a hull uses the hull transform and a grab from the deck puts the body outside
+  the wall, not between the rungs and the deck; kinds 2/3/6/7/10 take the side from the player's
+  facing (`FUN_3916c520`). A picked ladder lights up (`use_target_highlight`) and only takes the
+  click when it is the nearest hit along the ray; a ladder parented to the picked slave beats that
+  slave's loose box (the masts/sails entry), while a nearer unit or doodad keeps the click; an
+  out-of-reach ladder click is left to that path instead of being swallowed. The grab is refused on a seat,
+  glider or skill move and while the unit is BOUND to a vehicle (`+0x3af0`, its seat `+0x3af4`,
+  `FUN_393b8f40`); a deck walker sends its own moves with `+0x3af0` null, so a deck does not refuse
+  it, and water does not either (there is no swim gate in `FUN_393630e0`); only a grab the gates
+  accept claims F over NPC talk and loot-all. W/S climb with the clip's root speed scaled by the buffs'
   `ladder_speed_mul`, and every hanging `CSMoveUnit` carries actor flag `0x40`, gcId 1 and the grab's
   climb data (`FUN_390cbee0` bit layout, truncating, angle 127 for kinds 1/4/5/8/9). The sender sends
   every 0.1 s while climbing, one `moving: false` stop packet no sooner than the native 100 ms minimum
@@ -406,15 +457,21 @@ auto-walk, mount jump clips, larger ships, and the copper boiler colour; remote 
   the step. The bottom stands on the terrain or a brush (a dock or a lower deck, the same support query
   movement uses) or starts swimming (never `grounded` in the air). Death is the only native 0xb site
   (`FUN_39137320`: the value reaches 0) and sends `CSUnhang` 0xb alone; mounting, a moving skill, a
-  stance change or a glider does not release a hang. F releases and Space jumps (mode 6). Remote hangers
-  use the `SCHung` target's kind and the climb data; a hull hanger rides the drawn hull. Covered by
-  `examples/ladder_climb`, byte-exact climb tests in `aa-net/src/climb.rs`, the
-  start/stop/top/bottom/moving-hull/rotated-hull/gate/water/death/F-claim tests in `ingame/ladder` and
-  `hud/doodad`, the clip mapping test against the player graph, and remote hanger tests in
-  `ingame/units`. Open (capture-pending): which key produces exit modes 3-9, the exact climb
-  `deltaMovement`/velocity, net/guardrail lateral `y`, top-step distance, camera pitch clamp, and the
-  remote client's own hanger animation consumer. Mount-start while already hanging is not gated by this
-  client and not released (the native has no such release); capture-pending.
+  stance change or a glider does not release a hang. A plain Space jump sends `CSUnhang` 7, the
+  `FUN_39135570` mode-7 back-hop away from the ladder (-2.0 forward, 4.0 up, a -0.3 m nudge), not
+  the mode-6 forward leap; A+Space sends mode 4 (local -X) and D+Space mode 5 (local +X) with the
+  -/+2.0, 4.0 and -/+0.3 numbers. The 2026-11-01 original-client capture saw 7 with no lateral
+  input (also with W held); the owner's 14:20 session that day (ship ladder) captured A+Space -> 4
+  and D+Space -> 5, while 6 was never captured. F release and the bottom exit send 1 here:
+  inferred, since the only native 1 sender is `FUN_39134930` during a running top exit. Remote
+  hangers use the `SCHung` target's kind and the climb data; a hull hanger rides the drawn hull.
+  Covered by `examples/ladder_climb`, byte-exact climb tests in `aa-net/src/climb.rs`, the
+  start/stop/top/bottom/jump/moving-hull/rotated-hull/ship-ladder/front-side/right-click/gate/water/
+  death/F-claim tests in `ingame/ladder`, the ladder pick test in `hud/doodad`, the clip mapping
+  test against the player graph, and remote hanger tests in `ingame/units`. Open (capture-pending): which input produces modes 3/6/8/9, the
+  exact climb `deltaMovement`/velocity, net/guardrail lateral `y`, top-step distance, camera pitch
+  clamp, and the remote client's own hanger animation consumer. Mount-start while already hanging
+  is not gated by this client and not released (the native has no such release); capture-pending.
 
 Still open across these slices: vehicle state/FX (S15), auto-walk, mount jump clips, larger ships, and
 the copper boiler colour; remote vehicle smoothing (S8) and gliders (S14) landed with their own captures, and the walk
@@ -1220,9 +1277,9 @@ not turn it into a current completion claim.
 | Party and raid | Original invite/decline/accept/leave/kick/leader/convert/role/drag-move/loot controls and native group-loot prompts; sparse slots, offline/rejoin, unit-frame marks and authoritative map pings; live two-client coverage | Natural paired live loot settlement,3D overhead marks, party buff/combat indicators; broader raid UI coverage and instance-specific ping surfaces |
 | Social/community | Original friend/block tabs, acknowledged commands, status/list refresh and blocked chat; original family roster/count/offline rows, native callbacks, feature/owner-guarded actions and captured invitation/ignore controls; original guild roster/location/offline rows, permission/title editing, invite/reply, leave/disband, kick/rank and received-siege-guarded leadership transfer; guild-service preconfirmation/sponsors/Create and actual received Task35 Rename | Paired live family/guild settlement, overhead family/guild titles and broader interruption coverage; live unblock/offline/restart checks; lane political-system/rename completion gaps, guild web/siege controls, nation and remaining management |
 | Mail, trade and auctions | Original mailbox read/claim/write/send and player-trade carts/money/locks/confirm/cancel bound; original-stage fixtures; mail/trade protocols live-tested in aa-net before the lane stall; original auction house search, bid, buy-out, listing, cancel and bid history, driven live between two accounts | Paired live original mail/trade and restart checks; native trade eligibility/window bounds; auction settlement mails claimed through the window, bid/buy-out chat notices of other players |
-| Crafting, gathering and trade packs | Original Folio browses7,010 real recipes, groups/categories/search/materials/products/higher-tier links; received physical materials/raw grades and native labor rounding; static workbench maps and batch controls; original proficiency grades, caps, upgrade/downgrade/certificate expansion controls/events with pointer probes and captures; natural gathering func-to-skill mapping with the ordinary cast/tool/anim/labor/loot/phase path (1.2 capture 2026-10-30: herb 13990 on F sends `CSStartSkill`, fake-use lamp 13166, local no-labor refusal, bar on at 3 m and off at 4.5 m, cast not gated by a full bag; the 4000 ms cast, 1 LP and phase 4513->4514 in that capture are our server's values - `SCSkillStarted`, `SCCharacterLaborPowerChanged`, `SCDoodadPhaseChanged`; legacy ore/rock/shear capture-pending); later: seed placement 30 m / yaw / 6 m spread / the two locks per #56; trade-pack storage sends 15307 with no client pre-check, as the 1.2 client does | Natural workbench input/range/permissions, remaining execution/live validation, premium proficiency payment configuration and housing bonuses, legacy ore/rock/shear gathering capture, gathered-item delivery into free bag space (every captured herb gather had a full bag), processing/workbenches, specialty/trade pack flows; later: the trade-pack storage refusal is server-side (AAEmu #30 in review) |
+| Crafting, gathering and trade packs | Original Folio browses7,010 real recipes, groups/categories/search/materials/products/higher-tier links; received physical materials/raw grades and native labor rounding; static workbench maps and batch controls; original proficiency grades, caps, upgrade/downgrade/certificate expansion controls/events, the native gain/grade chat lines and actability modifier refresh with pointer probes and captures; natural gathering func-to-skill mapping with the ordinary cast/tool/anim/labor/loot/phase path (1.2 capture 2026-10-30: herb 13990 on F sends `CSStartSkill`, fake-use lamp 13166, local no-labor refusal, bar on at 3 m and off at 4.5 m, cast not gated by a full bag; the 4000 ms cast, 1 LP and phase 4513->4514 in that capture are our server's values - `SCSkillStarted`, `SCCharacterLaborPowerChanged`, `SCDoodadPhaseChanged`; legacy ore/rock/shear capture-pending); later: seed placement 30 m / yaw / 6 m spread / the two locks per #56; trade-pack storage sends 15307 with no client pre-check, as the 1.2 client does | Natural workbench entry now opens the local window through the phase's CraftStart/CraftPack action (`CRAFTING_START(objectID,count)`), offers it at the bar distance, walks on use outside the native 2.1 m range, checks `FUN_393b3300`'s permissions per craft func (0-8, inferred where the client lacks account/zone data), shows 0x9a for an out-of-range request and fires `INTERACTION_END` when a second bench opens; live execution validation, premium proficiency payment configuration and housing bonuses, legacy ore/rock/shear gathering capture, gathered-item delivery into free bag space (every captured herb gather had a full bag), processing/workbenches, specialty/trade pack flows; later: the trade-pack storage refusal is server-side (AAEmu #30 in review) |
 | Housing and territory | Static placed world data/map icons; received house snapshots/progress/permission/demolition flags, parent/TL decoration joins and aligned housing unit tails/posture; the 1.2 owner menu (interaction `viewType` from the design category, permission gates 0x80/0x178/0x137 with one `CSChangeHousePermission` per changed click, `GetHouseDecoCount` minus the built-in binding doodads against `absolute_deco_limit`, the four actability getters from `housing_deco_limit_elems`/`deco_actability_groups`, the raw tax weeks and the paid/due/overdue window texts) with an original-script self-check; the sale, cancel and buy client gates in their native order (0x282-0x29c/0x2a9, 0x28b/0x28c, 0x28e-0x291 with their `ERROR_MSG` keys), `GetHouseSaleInfo`/`GetHouseSaleItemInfo` (28085 one per 100 gold), a pending-request fail-event mapping (`HOUSE_SET_SELL_FAIL`/`HOUSE_BUY_FAIL`/`HOUSE_CANCEL_SELL_FAIL`), the receipt order (`HOUSE_SET_SELL_SUCCESS` -> `HOUSE_INFO_UPDATED`, `SCHouseSold` -> `HOUSE_INFO_UPDATED` then `HOUSE_SALE_SUCCESS`/`HOUSE_BUY_SUCCESS`), demolish skill 12945 (`DAT_39ac99e0`, 20 s) and the demolished owner clear with the standing model, with a two-session self-check; seed/sapling placement rules from the 1.2 builder (30 m 3D inclusive per F1/F2, group yaw per F4, 6 m terrain spread and its exemptions per F7, water, sphere overlap, refusal texts, 30 s world-load lock and the 2 s post-send cooldown per F13; the same seed again cancels the aim under either lock) with an offscreen self-check; later: the housing builder (ghost, rotation, land/category/garden checks, tax quote, `CSConstructHouseTax` / `CSCreateHouse`) and the build/construction windows are on main (3de58d05, fd986eba), the shipyard construction stages (#70) are decoded and drawn, houses render at their stage model, and a Bevy live check received the 45-certificate Start Construction quote without sending the create | Furniture placement/decoration mode, farms/permissions/ownership/tax live, territory/siege/dominion, construction and interaction live flows, the sale fail-event trigger and demolish visuals (C5); farm planting F1-F18 (F1/F2/F4/F7/F13 settled; box shapes, water site, house/zone rules, crop bar/harvest open); later: furniture/decoration (`CSDecorateHouse` empty), live create/construction/tax/sale settlement, the original-client comparison, door/stair models and house HP/repair |
-| Pets, slaves and transport | Remote units/support motion rendered; owned mate/slave metadata, original current-pet frame/bar and information panel with native received-level/equipment/buff attributes, pool maxima and modifier colors; original pack-specific equipment icons and own-item hover tooltips with tag29/received pet level cap; filtered skill presentation/capabilities, received-XP getter, original rename and behavior controls; stablehand revival requests and raw equipment transactions decoded; vehicle and prefab engine idle loop (`VehicleIdle` from `UpdateIdleAnim`), the speed-keyed `engine` loop and movement-gated `run` sound, dead stop, and spindle steering after the animation pose; later: remote vehicle movement (#52), glider casting (#49), passenger seats (#54), cannons and turrets (#55), shipping helm request type 4 and deck support movement | Native speed-component getter, equipment cursor/confirmation/transaction controls, general skill usability/planner/auto-use, cap-aware XP delta folding, mount/dismiss eligibility, summon/unsummon/equipment/skills, slave UI and ships/cannons/transport controls; later: the mode-bar function slots (unbind / Summon Info, G13), the slave F board prompt (G14), hanging (S13) and vehicle damage/FX (S15); the Farm Wagon has no point 2 in 1.2, so its passenger seat is a server bug |
+| Pets, slaves and transport | Remote units/support motion rendered; owned mate/slave metadata, original current-pet frame/bar and information panel with native received-level/equipment/buff attributes, pool maxima and modifier colors; original pack-specific equipment icons and own-item hover tooltips with tag29/received pet level cap; filtered skill presentation/capabilities, received-XP getter, original rename and behavior controls; stablehand revival requests and raw equipment transactions decoded; vehicle and prefab engine idle loop (`VehicleIdle` from `UpdateIdleAnim`), the speed-keyed `engine` loop and movement-gated `run` sound, dead stop, and spindle steering after the animation pose; later: remote vehicle movement (#52), glider casting (#49), passenger seats (#54), cannons and turrets (#55), shipping helm request type 4 and deck support movement | Native speed-component getter, equipment cursor/confirmation/transaction controls, general skill usability/planner/auto-use, cap-aware XP delta folding, mount/dismiss eligibility, summon/unsummon/equipment/skills, slave UI and ships/cannons/transport controls; later: the mode-bar function slots (unbind / Summon Info, G13), the slave F board prompt (G14), hanging (S13); the S15 vehicle damage/FX slice is in (see below); the Farm Wagon has no point 2 in 1.2, so its passenger seat is a server bug |
 | Child slave units (cannons) | `SCUnitState`'s parent object id and first attach point resolve a child slave's parent-local position/rotation through the parent; `unit_world_pose` composes the drawn root's current `Transform` chain (so a parent moved in `Update` and a freshly spawned root do not lag a frame) or the parent-composed packet pose and feeds the draw radius/census, manning distance, get-on/follow mover, seat pose, plates/speech/combat positions/marks/overhead/target panel/combat text/loot; the drawn root is `ChildOf` the parent root, a detach restores a world root, a parent despawn takes the child with it and a known-unbuildable parent fails the child once; the `child_units` example drives the real `receive_moves`/`sync_views` and checks the 90 degree yaw offset and the hierarchy | The parent model's attach-point pose is not reimplemented (the server's `slave_attach_points` local offset is used, matching `Unit::AttachTo`'s parent-entity attachment); the right-click and tab-target pick sites (`hud/dialog.rs`, `hud/targeting.rs`) are owned by slave-pick and still use the raw point (capture-pending) |
 | Battlefields | Original recruiter, queue/cancel, three-choice invitation, received match phases/timers/score/results and leave controls; native slot244 skill identity/tag/enable gates; controlled original-script probes and captures | Natural lane matchmaking/live match QA; lane Pong/start timer-origin mismatch; protected native ordinary skill eligibility and actor planner/casting; queue errors and remaining scheduled-event presentation |
 | Duels | Challenge from the target popup, challenge prompt (default dialog with the original `locale.duel` texts), accept/refuse, `STARTED_DUEL`/`ENDED_DUEL`, start text and result notice, temporary team factions on plates/target | Retail placement of the countdown text (system message here); the AAEmu server now sends `SCDuelStartCountdownPacket` at acceptance (NickMesser/AAEmu#15), so the countdown shows live; `SCAreaChatBubble` 0x153 (type 543, ignored) |

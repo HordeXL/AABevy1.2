@@ -50,6 +50,8 @@ struct Lookups {
     /// `(model, attach point)` -> the seat's `attach_anims.anim_action_id`.
     attach_anims: HashMap<(u32, u8), Option<u32>>,
     ships: HashMap<u32, bool>,
+    /// `slaves.id` (the template id from the unit state) -> `slaves.slave_kind_id`.
+    slave_kinds: HashMap<u32, Option<u32>>,
     ship_steer: HashMap<u32, f32>,
     /// `models.id` -> the `vehicle_models` turret block (`None` for a bad row or a non-vehicle).
     turrets: HashMap<u32, Option<super::turret::TurretLimits>>,
@@ -86,18 +88,33 @@ pub struct AttachPointStrings {
 pub const DEFAULT_SHIP_STEER_VEL: f32 = 6.0;
 
 /// How fast a mount of a model goes with a rider (m/s): the run speed of its relaxed stance (`game_stances.ai_move_speed_run`,
-/// stance 2: a Lilyut horse 9, a donkey 7.2) and the walking and backward factors of its actor model.
+/// stance 2: a Lilyut horse 9, a donkey 7.2) and the walking and backward factors of its actor model. The speed follows a
+/// wanted one at the actor model's `game_inertia` (no input, 4 for a horse) or `game_inertia_accel` (any move request, 11)
+/// rate; the 1.2 loader reads the two columns as `inertia` / `inertiaAccel` (x2game `166815` / `166823`, the row copy at
+/// `221108` / `221118`), and CryPhysics chooses between them (`aaemu-physics entities/living/step.rs:171-179`). The
+/// 2026-11-02 capture's Leomorph ramps 0 -> 5.9 m/s in the first 103 ms packet and coasts 12.65 -> 8.3 -> 0.7 -> 0
+/// over 0.1 / 0.7 / 1.5 s, which is exactly those two exponential rates (feel capture 1).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MountSpeed {
     pub run: f32,
     pub walk: f32,
     pub backward: f32,
+    /// `actor_models.game_inertia`: response rate (1/s) with no input; 0 means no inertia.
+    pub inertia: f32,
+    /// `actor_models.game_inertia_accel`: response rate (1/s) for a move request; 0 means no inertia.
+    pub accel: f32,
 }
 
 impl Default for MountSpeed {
     /// A horse's.
     fn default() -> Self {
-        MountSpeed { run: 9.0, walk: 0.2, backward: 0.2 }
+        MountSpeed {
+            run: 9.0,
+            walk: 0.2,
+            backward: 0.2,
+            inertia: 4.0,
+            accel: 11.0,
+        }
     }
 }
 
@@ -358,6 +375,7 @@ impl Lookups {
             attach_points: HashMap::new(),
             attach_anims: HashMap::new(),
             ships: HashMap::new(),
+            slave_kinds: HashMap::new(),
             ship_steer: HashMap::new(),
             turrets: HashMap::new(),
             cannon_skills: HashMap::new(),
@@ -652,6 +670,40 @@ impl Db {
 
     /// Whether a model is a ship (`models.sub_type` `ShipModel`): the server simulates its hull and the driver
     /// steers it with a CSMoveUnit type-4 request instead of the land-vehicle type 2.
+    /// The slave kind (`slaves.slave_kind_id`) of a slave by the template id the unit state
+    /// carries (the 1.2 client's `Unit+0x420` lookup, `x2game.dll.c:1937685`,
+    /// `FUN_39345ea0:677836`, `FUN_39696380:1427233`). Cached; `None` for an unknown row.
+    pub fn slave_kind(&self, template_id: u32) -> Option<u32> {
+        let mut l = self.lookups.lock().unwrap();
+        if let Some(kind) = l.slave_kinds.get(&template_id) {
+            return *kind;
+        }
+        let kind = l
+            .conn
+            .query_row(
+                "SELECT slave_kind_id FROM slaves WHERE id = ?1",
+                params![template_id],
+                |r| r.get::<_, Option<u32>>(0),
+            )
+            .ok()
+            .flatten();
+        l.slave_kinds.insert(template_id, kind);
+        kind
+    }
+
+    /// A synthetic deck floor for a test: the same cache entries [`Db::ship_floor`] fills from
+    /// the pak, without the hull prefab.
+    #[cfg(test)]
+    pub(crate) fn insert_ship_floor_fixture(
+        &self,
+        model_id: u32,
+        floor: Arc<super::ship::floor::ShipFloor>,
+    ) {
+        let mut l = self.lookups.lock().unwrap();
+        l.ship_bounds.insert(model_id, floor.bounds());
+        l.ship_floors.insert(model_id, Some(floor));
+    }
+
     pub fn is_ship(&self, model_id: u32) -> bool {
         let mut l = self.lookups.lock().unwrap();
         if let Some(ship) = l.ships.get(&model_id) {
@@ -973,6 +1025,34 @@ impl Db {
             .map_or(0.0, |time| time.max(0.0) as f32)
     }
 
+    /// The summon portal of a slave template (`slaves.portal_spawn_fx_id`, an `fx_groups` row, with `portal_scale`
+    /// and `portal_time` in seconds). `OnSlaveCreated` pushes the slave's object id into `SlaveManager`'s pending
+    /// list unless `SCSlaveCreatedPacket.hideSpawnEffect` is set (`FUN_3934a6c0` -> `FUN_3934a530`), and
+    /// `FUN_39349600` plays this group on the unit with those two values. 67 slaves (the vehicles and ships) have
+    /// one; the other rows, and a missing row, give `None`.
+    pub fn slave_summon_portal(&self, template_id: u32) -> Option<SummonPortal> {
+        let l = self.lookups.lock().unwrap();
+        let portal = l
+            .conn
+            .query_row(
+                "SELECT portal_spawn_fx_id, portal_scale, portal_time FROM slaves WHERE id = ?1",
+                params![template_id],
+                |r| {
+                    Ok(SummonPortal {
+                        fx_group: r.get::<_, Option<i64>>(0)?.unwrap_or(0).max(0) as u32,
+                        scale: r.get::<_, Option<f64>>(1)?.unwrap_or(1.0) as f32,
+                        time: r.get::<_, Option<f64>>(2)?.unwrap_or(0.0) as f32,
+                    })
+                },
+            )
+            .ok()?;
+        (portal.fx_group != 0).then(|| SummonPortal {
+            scale: if portal.scale > 0.0 { portal.scale } else { 1.0 },
+            time: portal.time.max(0.0),
+            ..portal
+        })
+    }
+
     /// The maximum health of a slave template: its unit attribute 6 (`MaxHealth`) as the 1.2 client's
     /// `FUN_390b4a70` reads it (`FUN_398a0bc0`): the `unit_formulas` base of the attribute, plus the flat
     /// `unit_modifiers` rows, then one summed percent multiplier on that sum.
@@ -1185,11 +1265,11 @@ impl Db {
         let speed = l
             .conn
             .query_row(
-                "SELECT g.ai_move_speed_run, a.game_walk_multiplier, a.game_backward_multiplier FROM models m                  JOIN actor_models a ON a.id = m.sub_id AND m.sub_type = 'ActorModel'                  LEFT JOIN game_stances g ON g.actor_model_id = a.id AND g.stance_id = 2 WHERE m.id = ?1",
+                "SELECT g.ai_move_speed_run, a.game_walk_multiplier, a.game_backward_multiplier, a.game_inertia, a.game_inertia_accel FROM models m                  JOIN actor_models a ON a.id = m.sub_id AND m.sub_type = 'ActorModel'                  LEFT JOIN game_stances g ON g.actor_model_id = a.id AND g.stance_id = 2 WHERE m.id = ?1",
                 params![model_id],
                 |r| {
                     let f = |i: usize, default: f32| -> rusqlite::Result<f32> { Ok(r.get::<_, Option<f64>>(i)?.map_or(default, |v| v as f32)) };
-                    Ok(MountSpeed { run: f(0, d.run)?, walk: f(1, d.walk)?, backward: f(2, d.backward)? })
+                    Ok(MountSpeed { run: f(0, d.run)?, walk: f(1, d.walk)?, backward: f(2, d.backward)?, inertia: f(3, d.inertia)?, accel: f(4, d.accel)? })
                 },
             )
             .unwrap_or(d);
@@ -1645,6 +1725,16 @@ fn ship_steer_vel_from_conn(conn: &Connection, model_id: u32) -> f32 {
     .map_or(DEFAULT_SHIP_STEER_VEL, |v| v as f32)
 }
 
+/// The summon portal of a slave (`slaves.portal_spawn_fx_id`): an effect group of `fx_groups`, its scale and how long
+/// it lasts (`portal_time`), as `FUN_39349600` hands them to the world.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SummonPortal {
+    /// `fx_groups.id` (1263 `portal_tank_spawn` for slave 146); 0 in the row means none.
+    pub fx_group: u32,
+    pub scale: f32,
+    pub time: f32,
+}
+
 /// What a vehicle or ship is drawn from ([`Db::vehicle_look`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct VehicleLook {
@@ -1995,7 +2085,7 @@ mod tests {
     #[test]
     fn the_database_holds_the_mount_speeds() {
         let Some(db) = Db::open() else { return };
-        assert_eq!(db.mount_speed(139), MountSpeed { run: 9.0, walk: 0.2, backward: 0.2 });
+        assert_eq!(db.mount_speed(139), MountSpeed { run: 9.0, walk: 0.2, backward: 0.2, inertia: 4.0, accel: 11.0 });
         assert!((db.mount_speed(953).run - 7.2).abs() < 1e-5);
     }
 

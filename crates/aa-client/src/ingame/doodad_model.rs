@@ -49,6 +49,8 @@ pub struct Spawned {
     pub helpers: HashMap<String, Affine3A>,
     /// The climb helper, when the model has a usable `$ladder`.
     pub ladder: Option<LadderHelper>,
+    /// The combined LOD 0 bounds in the prefab local Cry frame, for the interaction gap.
+    pub bounds: Option<(Vec3, Vec3)>,
 }
 
 /// The `$ladder` helper of a model part, in the doodad root's Bevy space. The helper's matrix is
@@ -147,6 +149,7 @@ fn prepare_inner(loader: &CryLoader, reference: &str, with_bounds: bool) -> Opti
             pos: Vec3::ZERO,
             rot: Quat::IDENTITY,
             scale: Vec3::ONE,
+            animation: None,
         }]
     };
     let mut pieces = Vec::new();
@@ -201,7 +204,7 @@ pub fn spawn(commands: &mut Commands, cry: &mut CryAssets, prepared: Prepared) -
         prefab,
         pieces,
         helpers,
-        bounds: _,
+        bounds,
         ladder,
     } = prepared;
     let root = prefab.then(|| {
@@ -238,6 +241,7 @@ pub fn spawn(commands: &mut Commands, cry: &mut CryAssets, prepared: Prepared) -
         entity: root.or(single).expect("prepared doodad contains geometry"),
         helpers,
         ladder,
+        bounds,
     }
 }
 
@@ -254,6 +258,7 @@ mod tests {
             pos: Vec3::new(7.0, 8.0, 9.0),
             rot: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
             scale: Vec3::new(2.0, 3.0, 4.0),
+            animation: None,
         };
         let node = |name: &str, parent, local| Node {
             name: name.into(),
@@ -327,6 +332,7 @@ mod tests {
                 pos: Vec3::ZERO,
                 rot: Quat::IDENTITY,
                 scale: Vec3::ONE,
+                animation: None,
             };
             let ladder =
                 ladder_of(&part, &model).unwrap_or_else(|| panic!("{path}: no $ladder segment"));
@@ -360,6 +366,7 @@ mod tests {
             pos: Vec3::ZERO,
             rot: Quat::IDENTITY,
             scale: Vec3::ONE,
+            animation: None,
         }
     }
 
@@ -466,6 +473,7 @@ mod tests {
             pos: Vec3::new(10.0, 0.0, 0.0),
             rot: Quat::IDENTITY,
             scale: Vec3::splat(2.0),
+            animation: None,
         };
         let (lo, hi) = part_bounds(&part, &model).expect("hull bounds");
         assert!((lo - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5, "{lo}");

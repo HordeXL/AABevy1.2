@@ -7,6 +7,7 @@ use aa_cry::CRY_TO_BEVY;
 use bevy::prelude::*;
 
 use super::anim::{Locomotion, Motion};
+use super::housing::prefab::PrefabAnimation;
 
 /// The original head CAL declares its facial library. This avoids parsing body/clothing
 /// geometry as expression targets for every member of a crowd; CAL results are shared.
@@ -70,6 +71,8 @@ pub(crate) struct Spawned {
     pub root: Entity,
     pub idle: Option<BoundClip>,
     pub dead: Option<BoundClip>,
+    /// The prefab's authored animation when it started: `Some(looping)`.
+    pub authored: Option<bool>,
 }
 
 /// Spawns the model at `file` (`.cdf`, `.chr` or `.cgf`, pak path). Returns the root entity with
@@ -77,12 +80,26 @@ pub(crate) struct Spawned {
 /// when the file cannot be loaded.
 /// `definition` is the same effective CDF used by the worker's model prewarm.
 pub(crate) fn spawn(commands: &mut Commands, cry: &mut CryAssets, clips: &ClipLibrary, file: &str, definition: Option<&Cdf>, transform: Transform) -> Option<Entity> {
-    spawn_with_idle(commands, cry, clips, file, definition, transform, true).map(|spawned| spawned.root)
+    spawn_model(commands, cry, clips, file, definition, transform, true, false, None).map(|spawned| spawned.root)
 }
 
 /// [`spawn`], also returning the model's idle clip, and without starting that idle when `play_idle` is off: a vehicle
 /// prefab body owns its idle loop (`vehicle::VehicleIdle`, the 1.2 `UpdateIdleAnim` rule) instead of the creature one.
-pub(crate) fn spawn_with_idle(commands: &mut Commands, cry: &mut CryAssets, clips: &ClipLibrary, file: &str, definition: Option<&Cdf>, transform: Transform, play_idle: bool) -> Option<Spawned> {
+pub(crate) fn spawn_with_idle(commands: &mut Commands, cry: &mut CryAssets, clips: &ClipLibrary, file: &str, definition: Option<&Cdf>, transform: Transform, play_idle: bool, animation: Option<&PrefabAnimation>) -> Option<Spawned> {
+    spawn_model(commands, cry, clips, file, definition, transform, play_idle, false, animation)
+}
+
+/// Spawns a model that is parented under a character bone, which already lives in CryEngine space
+/// (`model_root` of a character). Unlike [`spawn`], it does not add [`CRY_TO_BEVY`] again: a second
+/// conversion would turn the model 90 degrees (the opened glider stands on edge).
+pub(crate) fn spawn_cry_space(commands: &mut Commands, cry: &mut CryAssets, clips: &ClipLibrary, file: &str, transform: Transform) -> Option<Entity> {
+    spawn_model(commands, cry, clips, file, None, transform, true, true, None).map(|spawned| spawned.root)
+}
+
+/// The one internal path: `play_idle` starts the `.cal` idle loop (off for a vehicle body that owns its own),
+/// `cry_space` drops the [`CRY_TO_BEVY`] on the model root (on under a character bone that already is CryEngine space).
+#[allow(clippy::too_many_arguments)]
+fn spawn_model(commands: &mut Commands, cry: &mut CryAssets, clips: &ClipLibrary, file: &str, definition: Option<&Cdf>, transform: Transform, play_idle: bool, cry_space: bool, animation: Option<&PrefabAnimation>) -> Option<Spawned> {
     // the base skin and the extra skin attachments
     let (main, main_material, attachments, mut rigid) = if file.ends_with(".cdf") {
         let cdf = match definition.cloned().map(Ok).unwrap_or_else(|| Cdf::load(file)) {
@@ -116,16 +133,16 @@ pub(crate) fn spawn_with_idle(commands: &mut Commands, cry: &mut CryAssets, clip
     let rig = aa_anim::pose::shared_rig(&main).ok().filter(|r| !r.is_empty());
     let Some(rig) = rig else {
         // a static model
-        let options = ModelOptions::default();
+        let options = ModelOptions { cry_space, ..default() };
         let loaded = cry.load_model(&main, &options).ok()?;
         let model = spawn_loaded(commands, &main, &loaded, &options);
         let root = commands.spawn((Name::new(main.clone()), transform, Visibility::default())).id();
         commands.entity(model).insert(ChildOf(root));
-        return Some(Spawned { root, idle: None, dead: None });
+        return Some(Spawned { root, idle: None, dead: None, authored: None });
     };
     let skeleton = rig.skeleton.clone();
     let root = commands.spawn((Name::new(main.clone()), transform, Visibility::default())).id();
-    let model_root = commands.spawn((Name::new("model"), Transform::from_rotation(CRY_TO_BEVY), Visibility::default(), ChildOf(root))).id();
+    let model_root = commands.spawn((Name::new("model"), model_root_transform(cry_space), Visibility::default(), ChildOf(root))).id();
     let bones = spawn_bones(commands, model_root, &rig);
     let cal_path = format!("{}.cal", main.trim_end_matches(".chr"));
     let mut facial = None;
@@ -170,13 +187,22 @@ pub(crate) fn spawn_with_idle(commands: &mut Commands, cry: &mut CryAssets, clip
     let mut animator = Animator::new(rig.clone(), bones);
     let mut idle = None;
     let mut dead = None;
+    let mut authored = None;
     let mut entity = commands.entity(root);
     if let Some(set) = super::anim::shared_clip_set(&main, &cal_path, clips) {
         idle = Some(set.idle.clone());
-        if play_idle {
+        if let Some(animation) = animation {
+            // the prefab's `AnimObject` names this animation and starts it (`bPlaying`), e.g. the
+            // dying trailer's `dead_01` or the galleon flag's looping `spreaded`.
+            if let Some(clip) = super::anim::bind_clip(&rig, &set.cal, clips, &animation.name) {
+                animator.play(clip, animation.looping, 0.0);
+                authored = Some(animation.looping);
+            }
+        } else if play_idle {
             animator.play(set.idle.clone(), true, 0.0);
-        } else {
-            // the vehicle path plays its own death clip (`vehicle::stop_dead_vehicles`): `dead_01`/`dead_02` of this `.cal`
+        }
+        // the vehicle path also keeps the death clip for `vehicle::stop_dead_vehicles`
+        if !play_idle {
             dead = ["dead_01", "dead_02"].iter().find_map(|name| super::anim::bind_clip(&rig, &set.cal, clips, name));
         }
         // monsters stand in a fighting stance while they fight (`fist_ba_combat_idle`)
@@ -187,7 +213,13 @@ pub(crate) fn spawn_with_idle(commands: &mut Commands, cry: &mut CryAssets, clip
     }
     entity.insert((animator, Motion::default()));
     if let Some(facial) = facial { entity.insert(facial); }
-    Some(Spawned { root, idle, dead })
+    Some(Spawned { root, idle, dead, authored })
+}
+
+/// The model root's rotation: CryEngine Z-up to Bevy Y-up for a world model, identity when the
+/// parent already is a CryEngine frame (a character bone).
+fn model_root_transform(cry_space: bool) -> Transform {
+    if cry_space { Transform::IDENTITY } else { Transform::from_rotation(CRY_TO_BEVY) }
 }
 
 #[cfg(test)]

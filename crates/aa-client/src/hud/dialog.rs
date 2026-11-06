@@ -33,6 +33,10 @@ pub(super) use npc::candidates::Catalog as NpcCandidateCatalog;
 pub(super) mod fixture;
 pub(super) use npc::{Scope as NpcScope, Selected as SelectedNpc, active_scope, choose_npc, close_npc, drive_npc, npc_menu_current, query_npc, scope_current};
 
+use std::collections::{BTreeMap, HashSet};
+use std::time::Duration;
+use web_time::Instant;
+
 use aa_net::interaction::Interact;
 use aa_net::model::{Unit, UnitKind};
 use aa_net::quest::{Quest, status};
@@ -52,12 +56,31 @@ use super::data::GameData;
 use super::quests::{CinemaDef, PlayerFacts, Texts, kind};
 use super::{HudKeyboardFocus, HudPointerOverUi};
 
-/// How far the player reaches to talk to an NPC (F, a right click), metres.
-const TALK_RANGE: f32 = 6.0;
+/// `FUN_393bf270` / `FUN_39093860`: the common interaction reach, the 3D surface gap strictly under
+/// `DAT_39ac79fc` 9.0, i.e. 3.0 m for a live target, and `DAT_39ac7a00` 12.25 (3.5 m) for a dead one:
+/// `+0x3c26` is the **target's** dead flag (`FUN_390b4df0` sets it; `FUN_393be4e0` reports `TARGET_DIED`).
+/// The same predicate gates the interaction skill a talk uses (`FUN_393be280`) and the right-click pick:
+/// the 2026-10-28 capture sent `CSStartInteraction` at 2.46 m and nothing at 4.57 m.
+const INTERACT_REACH: f32 = 3.0;
+/// The dead-target reach, `DAT_39ac7a00` 12.25 squared (corpse/loot).
+const DEAD_INTERACT_REACH: f32 = 3.5;
+/// How long a walk to an NPC may go without getting nearer before it is given up, seconds (the doodad walk's
+/// bound; the native click-to-move has no recovered timeout).
+const NPC_WALK_STUCK_SECS: f32 = 3.0;
+/// The keys that end the walk to an NPC (the player takes over), as for the doodad walk.
+const NPC_WALK_CANCEL_ACTIONS: [&str; 5] = ["moveforward", "moveback", "moveleft", "moveright", "jump"];
 /// A press that moves more than this many pixels before it is released was a camera drag.
 const CLICK_SLOP: f32 = 6.0;
 /// The widgets the dialog leaves shown when it hides the HUD.
 const DIRECTING_WIDGETS: [&str; 2] = ["questDirecting", "QuestDirectingFadeWindow"];
+
+/// Where a hand-in happens: the NPC or doodad the script named (the original's `who` 1 or 2), or
+/// nowhere (`who` 0: the quest journal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompleteSource {
+    Npc(u32),
+    Doodad(u32),
+}
 
 /// What the scripts asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +88,9 @@ pub(crate) enum Req {
     Accept(u32),
     /// The quest and the chosen reward (1 based, 0 for none).
     Complete(u32, i32),
+    /// `X2Quest:TryCompleteQuestContext(who, qtype, doodadId, npcId, selected)` from a path that is not
+    /// the directing dialog (the quest journal, a doodad's `COMPLETE_QUEST_CONTEXT_DOODAD`).
+    CompleteContext { quest: u32, selected: i32, source: Option<CompleteSource> },
     /// Quest, component, act of a talk objective.
     Talk(u32, u32, u32),
     Drop(u32),
@@ -89,6 +115,29 @@ struct PointerTalk {
     fallback: Option<(u32, u32)>,
 }
 
+/// The walk to an NPC that was right clicked beyond the interaction reach (`FUN_390a6af0`, the client's
+/// click-to-move, entered from `FUN_393bf270` when the interaction skill is out of reach). The use follows
+/// when the 3D surface gap is inside the reach.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Approach {
+    /// Object id and template of the NPC clicked.
+    pub npc: (u32, u32),
+    /// The authoritative target when the walk started: a different `Some` target (a new pick) cancels
+    /// it; the old target going away (`None`) does not (the mount walk's rule).
+    target: Option<u32>,
+    /// The nearest gap so far, metres, and when it was reached (`Time::elapsed_secs`).
+    best: f32,
+    best_at: f32,
+}
+
+/// A timed quest's clock (`FUN_3937b240`): the server's remaining milliseconds at receipt and the
+/// local receipt time. `left = end - (now - start) * 1000` (`FUN_39379e30`).
+#[derive(Clone, Copy, Debug)]
+pub struct QuestClock {
+    pub end_ms: i32,
+    pub started: Instant,
+}
+
 /// The talk under way and the quest data the scripts read.
 #[derive(Debug, Default)]
 pub struct DialogView {
@@ -103,6 +152,11 @@ pub struct DialogView {
     pub talk: Vec<(u32, u32, u32)>,
     /// The dialog is up (the rest of the HUD hidden).
     pub directing: bool,
+    /// The quest whose step the dialog is directing (`quest_context_directing.alb`'s window
+    /// `questType`): set only by `HUD.quest_show` when the window starts playing a step (and
+    /// cleared when directing ends), so a late refusal for an older quest cannot end a newer
+    /// window. Requests do not set it.
+    pub quest: Option<u32>,
     /// The top-level widgets hidden for it.
     hidden: Vec<aa_ui::tree::Id>,
     /// The movie wants every top-level widget hidden (C5).
@@ -113,6 +167,17 @@ pub struct DialogView {
     cinema_restore: Vec<aa_ui::tree::Id>,
     /// The active quests as the scripts last saw them, and its version (`HUD.quest_version()`).
     pub quests: Vec<Quest>,
+    /// The clock of each timed quest (`X2Quest:GetQuestContextLeftTime`), on the local clock:
+    /// `FUN_3937b240` stores the server's `time_left_ms` as its end and the local receipt time as
+    /// its start; `FUN_39379e30` returns `end - (now - start) * 1000`.
+    pub left_times: BTreeMap<u32, QuestClock>,
+    /// Quest instances whose clock a refusal cleared: `FUN_3937a130` removes the timer entry and
+    /// the tick must not add it again while the same quest is active.
+    cleared_left: HashSet<(u32, i64)>,
+    /// Quest instances whose clock has been started (Started / Updated, or the login list's first
+    /// tick): an expired clock is not restarted by the tick; the next Started / Updated is
+    /// (`FUN_3937b240` is the only creator).
+    seeded_left: HashSet<(u32, i64)>,
     pub version: u64,
     /// Whether `quests` holds the server's list yet (the first one raises no events).
     seen: bool,
@@ -121,6 +186,8 @@ pub struct DialogView {
     pub condition: String,
     pub(crate) requests: Vec<Req>,
     pointer_talk: Option<PointerTalk>,
+    /// The walk to a right-clicked NPC beyond the interaction reach ([`Approach`]).
+    pub(super) approach: Option<Approach>,
     npc_flow: npc::Flow,
 }
 
@@ -151,7 +218,9 @@ fn quest_table(lua: &Lua, game: &GameData, texts: &Texts, q: &Quest, active: boo
     row.set("livelihood", def.is_livelihood())?;
     row.set("group", def.is_group())?;
     row.set("selective", def.selective)?;
-    row.set("letItDone", def.let_it_done)?;
+    // the native getters' values (`quests.rs`), not the raw `let_it_done` column
+    row.set("letItDone", active && t.is_let_it_done(q))?;
+    row.set("overDone", active && t.is_over_done(q))?;
     row.set("chapter", def.chapter)?;
     row.set("zone", texts.zone_name(def.zone_id))?;
     // the objectives of the step the quest is at, and the paragraph above them (the step's hints, or
@@ -240,6 +309,22 @@ fn bubble_table(lua: &Lua, game: &GameData, texts: &Texts, which: &str, quest: u
 pub fn install(lua: &Lua, hud: &Table, bridge: &Shared) -> mlua::Result<()> {
     let b = bridge.clone();
     hud.raw_set("quest_version", lua.create_function(move |_, ()| Ok(b.borrow().dialog.version))?)?;
+    let b = bridge.clone();
+    hud.raw_set(
+        "quest_show",
+        lua.create_function(move |_, qtype: u32| {
+            b.borrow_mut().dialog.quest = (qtype != 0).then_some(qtype);
+            Ok(())
+        })?,
+    )?;
+    let b = bridge.clone();
+    hud.raw_set(
+        "quest_left_time",
+        lua.create_function(move |_, qtype: u32| {
+            let b = b.borrow();
+            Ok(b.dialog.left_times.get(&qtype).map_or(-1, |clock| clock_left_ms(clock, Instant::now())))
+        })?,
+    )?;
     let b = bridge.clone();
     hud.raw_set(
         "quest_list",
@@ -359,6 +444,23 @@ pub fn install(lua: &Lua, hud: &Table, bridge: &Shared) -> mlua::Result<()> {
     }
     request("quest_accept", |a| Some(Req::Accept(num(&a, 0) as u32)))?;
     request("quest_complete", |a| Some(Req::Complete(num(&a, 0) as u32, num(&a, 1) as i32)))?;
+    // `X2Quest:TryCompleteQuestContext(who, qtype, doodadId, npcId, selected)` without the dialog:
+    // `who` 1 is the NPC named by `npcId`, 2 the doodad named by `doodadId`, 0 the journal.
+    request("quest_complete_context", |a| {
+        let id = |i: usize| match a.get(i) {
+            Some(mlua::Value::String(s)) => s.to_str().ok().and_then(|s| s.trim().parse().ok()),
+            Some(mlua::Value::Integer(n)) => Some(*n as u32),
+            Some(mlua::Value::Number(n)) => Some(*n as u32),
+            _ => None,
+        };
+        let quest = num(&a, 1) as u32;
+        let source = match num(&a, 0) {
+            1 => id(3).map(CompleteSource::Npc),
+            2 => id(2).map(CompleteSource::Doodad),
+            _ => None,
+        };
+        Some(Req::CompleteContext { quest, selected: num(&a, 4) as i32, source })
+    })?;
     request("quest_talk", |a| Some(Req::Talk(num(&a, 0) as u32, num(&a, 1) as u32, num(&a, 2) as u32)))?;
     request("quest_drop", |a| Some(Req::Drop(num(&a, 0) as u32)))?;
     request("quest_end", |_| Some(Req::End))?;
@@ -549,6 +651,84 @@ pub fn sync_quests(rt: Option<NonSend<UiRuntime>>, bridge: NonSend<HudBridge>, f
     }
 }
 
+/// Milliseconds left of `clock` at `now` (`FUN_39379e30`): `end - (now - start) * 1000`, with the
+/// start the local time the Started / Updated packet was received (`FUN_3937b240`). The server's
+/// own accept stamp is not used.
+pub fn clock_left_ms(clock: &QuestClock, now: Instant) -> i32 {
+    let elapsed_ms = i64::try_from(now.saturating_duration_since(clock.started).as_millis()).unwrap_or(i64::MAX);
+    (i64::from(clock.end_ms) - elapsed_ms).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// One tick of the quest clock (`X2::GameClient::UpdateQuestLeftTime`, `FUN_3937cd80`): every clock
+/// with at least 1000 ms left is published as `(qtype, remaining_ms)`. A clock under that, or one
+/// whose quest is no longer timed, takes the native timeout path (`FUN_39379ea0`): it is removed
+/// and `QUEST_LEFT_TIME_UPDATED(qtype, 0)` is published once, so the notifier hides it
+/// (`quest_context_notifier.alb` F81).
+pub fn tick_left_times(left: &mut BTreeMap<u32, QuestClock>, quests: &[Quest], now: Instant) -> Vec<(u32, i32)> {
+    let mut events = Vec::new();
+    left.retain(|qtype, clock| {
+        let timed = quests.iter().any(|q| q.template_id == *qtype && q.time_left_ms > 0);
+        if !timed || clock_left_ms(clock, now) < 1000 {
+            events.push((*qtype, 0));
+            return false;
+        }
+        true
+    });
+    for (qtype, clock) in left.iter() {
+        events.push((*qtype, clock_left_ms(clock, now)));
+    }
+    events
+}
+
+/// One tick over the dialog's clocks: drop latches of quests no longer active, start the clock of
+/// a timed active quest seen for the first time at `now` (the login list has no Started packet),
+/// then [`tick_left_times`]. A refused instance stays latched until a Started / Updated releases it.
+fn tick_quest_clocks(dialog: &mut DialogView, quests: &[Quest], now: Instant) -> Vec<(u32, i32)> {
+    let active: HashSet<(u32, i64)> = quests.iter().map(|q| (q.template_id, q.id)).collect();
+    dialog.cleared_left.retain(|key| active.contains(key));
+    dialog.seeded_left.retain(|key| active.contains(key));
+    let timed: Vec<Quest> = quests
+        .iter()
+        .filter(|q| q.status == status::PROGRESS && q.time_left_ms > 0)
+        .filter(|q| !dialog.cleared_left.contains(&(q.template_id, q.id)))
+        .cloned()
+        .collect();
+    for q in &timed {
+        // The login list has no Started packet: seed its clock once, at this tick's local time.
+        // An expired clock stays gone until the server sends the next Started / Updated.
+        if dialog.seeded_left.insert((q.template_id, q.id)) {
+            dialog.left_times.entry(q.template_id).or_insert(QuestClock { end_ms: q.time_left_ms, started: now });
+        }
+    }
+    tick_left_times(&mut dialog.left_times, &timed, now)
+}
+
+/// The quest clock runs at most once a second (the native's 1.0 s constant `0x3999c488`) and tells
+/// the tracker the remaining milliseconds of every timed quest (`QUEST_LEFT_TIME_UPDATED`).
+pub fn tick_quest_left_time(
+    rt: Option<NonSend<UiRuntime>>,
+    bridge: NonSend<HudBridge>,
+    quests: Res<Quests>,
+    mut last: Local<Option<Instant>>,
+) {
+    let now = Instant::now();
+    if last.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
+        return;
+    }
+    *last = Some(now);
+    let events = {
+        let mut d = bridge.0.borrow_mut();
+        if d.game.get().is_none() {
+            return;
+        }
+        tick_quest_clocks(&mut d.dialog, &quests.active, now)
+    };
+    let Some(rt) = rt else { return };
+    for (qtype, left) in events {
+        rt.fire_event("QUEST_LEFT_TIME_UPDATED", (qtype, left));
+    }
+}
+
 /// The pointer and the 3D view, for the right click.
 #[derive(SystemParam)]
 pub struct Pointer<'w, 's> {
@@ -558,7 +738,8 @@ pub struct Pointer<'w, 's> {
     cameras: Query<'w, 's, (&'static Camera, &'static GlobalTransform), (With<Camera3d>, Without<crate::hud::ModelViewCamera>)>,
 }
 
-/// The NPC or vehicle a right click released over the 3D view picked (not a drag, not on the HUD).
+/// The NPC or vehicle a right click released over the 3D view picked (not a drag, not on the HUD),
+/// with its distance along the ray.
 fn right_click_pick(
     p: &Pointer,
     units: &Units,
@@ -567,7 +748,7 @@ fn right_click_pick(
     pressed_at: &mut Option<Vec2>,
     blocked: bool,
     pick: &mut super::pick::PickWorld,
-) -> Option<u32> {
+) -> Option<(f32, u32)> {
     if blocked { *pressed_at = None; return None; }
     let window = p.windows.single().ok()?;
     let cursor = window.cursor_position();
@@ -583,14 +764,18 @@ fn right_click_pick(
     }
     let (camera, transform) = p.cameras.iter().find(|(c, _)| c.is_active)?;
     let ray = camera.viewport_to_world(transform, end).ok()?;
-    super::pick::pick_unit(
+    let (entry, id) = super::pick::pick_unit_hit(
         &ray,
         units,
         own,
         ridden,
         |u| matches!(u.kind, UnitKind::Npc { .. } | UnitKind::Slave { .. }),
         |unit, ray| pick.data(unit, units, ray),
-    )
+    )?;
+    let unit = units.get(id)?;
+    let (at, model) = pick.data(unit, units, &ray);
+    let along = crate::hud::pick::unit_compare_hit(&ray, unit, at, model).unwrap_or(entry);
+    Some((along, id))
 }
 
 /// `--hud-talk-nearest T` (talk to the nearest NPC that has something for the player, T seconds
@@ -634,8 +819,64 @@ impl ScriptedTalk {
     }
 }
 
+/// The interaction reach: 3.0 m for a live target, 3.5 m for a dead one (`FUN_393bf270`'s `+0x3c26`
+/// target-dead variant; `FUN_39093860` compares strictly).
+fn interact_reach(unit: &Unit) -> f32 {
+    if unit.dead { DEAD_INTERACT_REACH } else { INTERACT_REACH }
+}
+
+/// The unit's scaled actor-model radius, the same `Unit.ModelSize` source the server and `api::distance_to` use.
+fn npc_radius(game: Option<&GameData>, unit: &Unit) -> f32 {
+    game.map_or(0.0, |g| g.model_size(unit.model_id, unit.scale))
+}
+
+/// The 3D surface gap from the player to an NPC (`FUN_39093860`'s geometry distance, approximated with one
+/// scaled actor-model radius per unit like the slave path; the exact collider pair is not recovered).
+fn npc_gap(d: &HudData, me: Vec3, at: Vec3, unit: &Unit) -> f32 {
+    super::slave::surface_gap(me, d.player_radius, at, npc_radius(d.game.get(), unit))
+}
+
+/// Whether an NPC is inside the interaction reach. `FUN_39093860` returns inside only while the gap is
+/// strictly under the limit, so exactly 3.0 m (3.5 m mounted) is already out.
+fn npc_in_reach(d: &HudData, me: Vec3, at: Vec3, unit: &Unit) -> bool {
+    npc_gap(d, me, at, unit) < interact_reach(unit)
+}
+
+/// What a right click on an NPC does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NpcClick {
+    /// Inside the reach: the talk starts (`CSChangeTarget` + `CSInteractNPC`/`CSStartInteraction`).
+    Talk((u32, u32)),
+    /// Beyond the reach: walk there first and send nothing yet.
+    Walk((u32, u32), f32),
+}
+
+/// The right-click gate: a live, non-hostile NPC is talked to inside the interaction reach and otherwise
+/// walked to (`FUN_393bf270` -> `FUN_390a6af0`); a hostile NPC (an enemy is attacked, not talked to) and a
+/// non-NPC are ignored.
+fn plan_npc_click(
+    d: &HudData,
+    units: &Units,
+    own_faction: u32,
+    me: Vec3,
+    obj_id: u32,
+    at: Vec3,
+) -> Option<NpcClick> {
+    let game = d.game.get();
+    let unit = units
+        .get(obj_id)
+        .filter(|u| !u.dead && super::plates::relation_of(game, own_faction, u) != "hostile")?;
+    let UnitKind::Npc { template_id, .. } = unit.kind else { return None };
+    let gap = npc_gap(d, me, at, unit);
+    Some(if gap < interact_reach(unit) {
+        NpcClick::Talk((obj_id, template_id))
+    } else {
+        NpcClick::Walk((obj_id, template_id), gap)
+    })
+}
+
 /// The NPC nearest to the player in reach that can be talked to (alive, not hostile); with `wanted`,
-/// only one that has something for the player.
+/// only one that has something for the player. `range` is the surface gap limit.
 #[allow(clippy::too_many_arguments)]
 fn nearest_npc(
     d: &HudData,
@@ -655,17 +896,32 @@ fn nearest_npc(
         .filter_map(|u| {
             let UnitKind::Npc { template_id, .. } = u.kind else { return None };
             let at = world(u).unwrap_or(Vec3::new(u.pos.x, u.pos.y, u.pos.z));
-            let dist = me.distance(at);
-            if dist > range || super::plates::relation_of(game, own_faction, u) == "hostile" {
+            let gap = npc_gap(d, me, at, u);
+            // A scripted `talk` searches its whole range; the interact key (F) only reaches what the
+            // right click could talk to.
+            let limit = if wanted { range } else { range.min(interact_reach(u)) };
+            if gap >= limit || super::plates::relation_of(game, own_faction, u) == "hostile" {
                 return None;
             }
-            if wanted && game.is_none_or(|g| g.quests.mark(template_id, facts).is_none()) {
+            // with no game data there is no mark to prefer: keep the NPC rather than filtering all out
+            if wanted && game.is_some_and(|g| g.quests.mark(template_id, facts).is_none()) {
                 return None;
             }
-            Some((dist, (u.obj_id, template_id)))
+            Some((gap, (u.obj_id, template_id)))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, n)| n)
+}
+
+/// The parent slave of the right-clicked ladder, if any (a ship's side ladder).
+fn parent_of_climb(doodads: &Doodads, climb: Option<(f32, u32)>) -> Option<u32> {
+    climb.and_then(|(_, id)| {
+        doodads
+            .by_id
+            .get(&id)
+            .map(|o| o.parent_obj_id)
+            .filter(|parent| *parent != 0)
+    })
 }
 
 /// A right click on an NPC or F near one starts the talk; D / F / G drive the dialog while it is up.
@@ -685,9 +941,10 @@ pub fn talk_input(
     mut script: ResMut<ScriptedTalk>,
     mut script_pick: ResMut<crate::script::ScriptPick>,
     mut pressed_at: Local<Option<Vec2>>,
-    (teleport, ladder_claim): (
+    (teleport, ladder_claim, ladder_grab): (
         Option<Res<crate::ingame::teleport::Teleport>>,
         Option<Res<crate::ingame::ladder::LadderClaim>>,
+        Option<ResMut<crate::ingame::ladder::LadderGrab>>,
     ),
     suspended: Res<super::HudSuspended>,
 ) {
@@ -752,7 +1009,34 @@ pub fn talk_input(
     let pressed = |action: &str, index: u32, c: char| scripted_key == Some(c) || (!typing && actions.just_pressed(action, index));
     // a pick the script runner made (`interact`) takes the place of the ray cast, everything after it is the same
     let blocked = super::blocks_look_pointer(&bridge.0.borrow(), MouseButton::Right);
-    let picked = right_click_pick(&pointer, &units, own, ridden, &mut pressed_at, blocked, &mut pick);
+    // A right-clicked climb doodad takes the click only when it is in front of the unit/ship
+    // pick: a nearer unit (the hull included) keeps the right click (`climb_click` is this
+    // frame's nearest ladder distance and id along the ray).
+    let over_climb = bridge.0.borrow().doodad.climb_click();
+    let unit = right_click_pick(
+        &pointer,
+        &units,
+        own,
+        ridden,
+        &mut pressed_at,
+        blocked,
+        &mut pick,
+    );
+    let ladder_parent = parent_of_climb(&doodads, over_climb);
+    let ladder_wins = super::pick::doodad_beats_unit(over_climb, unit, ladder_parent);
+    if ladder_wins
+        && let Some((_, id)) = over_climb
+        && let Some(mut grab) = ladder_grab
+    {
+        // inferred: the native use-target path FUN_393b8f40 is the only CSHang sender, but no
+        // right-click-on-ladder capture exists
+        grab.0 = Some(id);
+    }
+    let picked = if ladder_wins {
+        None
+    } else {
+        unit.map(|(_, id)| id)
+    };
     let scripted_pick = script_pick.take_right();
     let picked = (!blocked).then_some(scripted_pick).flatten().or(picked);
 
@@ -773,11 +1057,12 @@ pub fn talk_input(
     let ladder_owns_key = ladder_claim
         .as_deref()
         .is_some_and(|claim| claim.0.is_some());
-    let interact_key = !scripted_talk
-        && pressed("do_interaction_1", 0, 'f')
+    let interact_pressed = !scripted_talk && pressed("do_interaction_1", 0, 'f');
+    let interact_key = interact_pressed
         && d.loot.nearest.is_none()
         && (scripted_key == Some('f') || (!d.doodad.claims_key() && !ladder_owns_key));
     if let Some(obj_id) = super::slave::action_target(&units, picked) {
+        cancel_walk(&mut d);
         super::slave::interact(&mut d, &units, target.obj_id, obj_id);
         if scripted_pick == Some(obj_id) {
             // The script's `interact` only completes once this path ran; taking the pick alone
@@ -786,22 +1071,41 @@ pub fn talk_input(
         }
         return;
     }
-    let pointer_npc = if let Some(obj_id) = picked {
-        // a right click: an NPC in reach that is not hostile (an enemy is attacked, not talked to)
-        let game = d.game.get();
-        units.get(obj_id).filter(|u| !u.dead && super::plates::relation_of(game, own_faction, u) != "hostile").and_then(|u| {
-            let UnitKind::Npc { template_id, .. } = u.kind else { return None };
-            let at = pick
-                .pose(u, &units)
-                .map_or(Vec3::new(u.pos.x, u.pos.y, u.pos.z), |(pos, _)| pos);
-            let dist = me.distance(at);
-            if dist > TALK_RANGE {
-                info!("hud: {} is too far away to talk to ({dist:.1} m)", u.name);
-                return None;
+    let pointer_npc = picked.and_then(|obj_id| {
+        // a right click: an NPC that is not hostile (an enemy is attacked, not talked to); beyond the
+        // interaction reach the click walks there first (`FUN_393bf270` -> `FUN_390a6af0`) and sends nothing
+        let at = units.get(obj_id).map_or(Vec3::ZERO, |u| {
+            pick.pose(u, &units)
+                .map_or(Vec3::new(u.pos.x, u.pos.y, u.pos.z), |(pos, _)| pos)
+        });
+        match plan_npc_click(&d, &units, own_faction, me, obj_id, at) {
+            Some(NpcClick::Walk(npc, gap)) => {
+                if seated_or_driving(&d) {
+                    info!("hud: {} is {gap:.1} m away but the player is seated: not walking", units.get(obj_id).map_or("?", |u| u.name.as_str()));
+                    cancel_walk(&mut d);
+                    return None;
+                }
+                let reach = units.get(obj_id).map_or(INTERACT_REACH, interact_reach);
+                info!("hud: {} is {gap:.1} m away (reach {reach:.1} m): walking there", units.get(obj_id).map_or("?", |u| u.name.as_str()));
+                start_walk(&mut d, npc, gap, now, target.obj_id);
+                None
             }
-            Some((obj_id, template_id))
-        })
-    } else { None };
+            Some(NpcClick::Talk(npc)) => {
+                cancel_walk(&mut d);
+                Some(npc)
+            }
+            None => {
+                // a hostile unit or a non-NPC: the click is not a talk, and it ends a running walk
+                cancel_walk(&mut d);
+                None
+            }
+        }
+    });
+    if interact_pressed || scripted_talk {
+        // F / a scripted talk is a new action: it ends a running walk, also when a doodad or loot
+        // takes the key and no NPC talk follows.
+        cancel_walk(&mut d);
+    }
     let keyboard_npc = if scripted_talk {
         nearest_npc(&d, me, &units, own, own_faction, &player_facts, 60.0, true, &|unit| {
             pick.pose(unit, &units).map(|(pos, _)| pos)
@@ -814,7 +1118,7 @@ pub fn talk_input(
             own,
             own_faction,
             &player_facts,
-            TALK_RANGE,
+            60.0,
             false,
             &|unit| pick.pose(unit, &units).map(|(pos, _)| pos),
         )
@@ -835,6 +1139,160 @@ fn dispatch_talk(shared: &Shared, npc: (u32, u32), target: Option<u32>) {
     let mut data = shared.borrow_mut();
     if super::portal::use_gate(&mut data, npc.0, npc.1) { return; }
     query_npc(&mut data, npc, target);
+}
+
+/// Starts the walk to an NPC that was right clicked beyond the interaction reach. A mount walk and a doodad
+/// walk give way (they hold the same forward key).
+pub(super) fn start_walk(data: &mut HudData, npc: (u32, u32), gap: f32, now: f32, target: Option<u32>) {
+    super::pets::cancel_mount_walk(data);
+    data.doodad.cancel_walk();
+    data.dialog.approach = Some(Approach {
+        npc,
+        target,
+        best: gap,
+        best_at: now,
+    });
+}
+
+/// Ends a walk to an NPC because another walk (a mount or a doodad) takes over. Returns whether one ran.
+pub(super) fn cancel_walk(data: &mut HudData) -> bool {
+    data.dialog.approach.take().is_some()
+}
+
+/// The player is on a slave seat, driving or sitting on a seat doodad: a forward key would drive the vehicle
+/// (or the seat blocks it), so the talk walk must not run. Riding a mate still walks.
+fn seated_or_driving(data: &HudData) -> bool {
+    data.mounted.slave_seat().is_some() || data.mounted.local_cart.is_some() || data.doodad.seated
+}
+
+/// What one frame of the walk to a right-clicked NPC decides.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NpcWalk {
+    /// No walk is running.
+    Idle,
+    /// Keep running at the NPC; the yaw to face it (radians, game terms).
+    Toward(f32),
+    /// The NPC came inside the interaction reach: the talk may start.
+    Arrived((u32, u32)),
+    /// The NPC is gone, the player took over or the walk made no progress.
+    Cancelled,
+}
+
+/// One frame of the walk to a right-clicked NPC: the same nearest-distance progress and stuck bound as the
+/// doodad walk, with `FUN_393bf270`'s 3D surface gap as the arrival test.
+fn step_npc_walk(
+    data: &mut HudData,
+    units: &Units,
+    me: Vec3,
+    at: Vec3,
+    now: f32,
+    target: Option<u32>,
+    interrupted: bool,
+) -> NpcWalk {
+    let Some(mut approach) = data.dialog.approach else { return NpcWalk::Idle };
+    let alive = units.get(approach.npc.0).is_some_and(|u| {
+        !u.dead && matches!(u.kind, UnitKind::Npc { template_id, .. } if template_id == approach.npc.1)
+    });
+    // A new `Some` target (Tab / left click) is the player taking over; a walk while seated or driving
+    // must not hold W (it would drive the vehicle).
+    let new_target = target.is_some() && target != approach.target;
+    if interrupted || !alive || new_target || seated_or_driving(data) {
+        data.dialog.approach = None;
+        return NpcWalk::Cancelled;
+    }
+    let Some(unit) = units.get(approach.npc.0) else {
+        data.dialog.approach = None;
+        return NpcWalk::Cancelled;
+    };
+    let gap = npc_gap(data, me, at, unit);
+    if gap < interact_reach(unit) {
+        data.dialog.approach = None;
+        return NpcWalk::Arrived(approach.npc);
+    }
+    let (best, best_at) = if gap < approach.best - 0.3 {
+        (gap, now)
+    } else {
+        (approach.best, approach.best_at)
+    };
+    if now - best_at > NPC_WALK_STUCK_SECS {
+        data.dialog.approach = None;
+        return NpcWalk::Cancelled;
+    }
+    approach.best = best;
+    approach.best_at = best_at;
+    data.dialog.approach = Some(approach);
+    let toward = (at - me).truncate();
+    NpcWalk::Toward((-toward.x).atan2(toward.y))
+}
+
+/// The walk to a right-clicked NPC that is beyond the interaction reach (`FUN_390a6af0`, the click-to-move the
+/// native interaction reach starts): steer at it through the normal movement path (the scripted forward key
+/// `control_player` reads) and start the talk when the surface gap is inside the reach. Movement input, a lost
+/// or dead NPC, a teleport and no progress for [`NPC_WALK_STUCK_SECS`] end it without a talk.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_to_npc(
+    actions: Res<crate::settings::Actions>,
+    focus: Res<HudKeyboardFocus>,
+    rt: Option<NonSend<UiRuntime>>,
+    bridge: NonSend<HudBridge>,
+    units: Res<Units>,
+    target: Res<Target>,
+    time: Res<Time>,
+    poses: super::pick::UnitPoses,
+    mut movers: Query<&mut crate::ingame::player::Mover, With<crate::ingame::player::LocalPlayer>>,
+    mut cameras: Query<&mut crate::ingame::camera::OrbitCamera>,
+    mut dev: ResMut<crate::ingame::DevOptions>,
+    teleport: Option<Res<crate::ingame::teleport::Teleport>>,
+    suspended: Res<super::HudSuspended>,
+    mut walking: Local<bool>,
+) {
+    let typing = focus.0 || rt.as_ref().is_some_and(|rt| rt.keyboard_captured());
+    let interrupted = !typing && NPC_WALK_CANCEL_ACTIONS.iter().any(|a| actions.pressed(a, 0));
+    let mut step = NpcWalk::Idle;
+    {
+        let mut d = bridge.0.borrow_mut();
+        if d.dialog.approach.is_some() && (suspended.0 || teleport.as_ref().is_some_and(|t| t.loading())) {
+            d.dialog.approach = None;
+        }
+        if d.dialog.approach.is_some() {
+            let world = |id: u32| units.get(id).and_then(|u| poses.get(u, &units));
+            let me = super::slave::player_centre(&d, &world);
+            let at = d
+                .dialog
+                .approach
+                .and_then(|a| units.get(a.npc.0))
+                .and_then(|u| poses.get(u, &units))
+                .map_or(Vec3::ZERO, |(pos, _)| pos);
+            step = step_npc_walk(&mut d, &units, me, at, time.elapsed_secs(), target.obj_id, interrupted);
+        }
+        let other_walk = d.doodad.walking() || super::pets::walking(&d);
+        match step {
+            NpcWalk::Toward(yaw) => {
+                *walking = true;
+                if let Ok(mut mover) = movers.single_mut() {
+                    mover.facing = yaw;
+                }
+                for mut camera in &mut cameras {
+                    camera.yaw = yaw;
+                }
+                if !dev.script_keys.contains('W') {
+                    dev.script_keys.push('W');
+                }
+                return;
+            }
+            NpcWalk::Arrived(npc) => info!("hud: reached {} for the talk", npc.0),
+            NpcWalk::Cancelled if interrupted => info!("hud: the walk to the NPC was taken over"),
+            NpcWalk::Cancelled => info!("hud: the walk to the NPC gave up"),
+            NpcWalk::Idle => {}
+        }
+        let was_walking = std::mem::take(&mut *walking);
+        if (was_walking || matches!(step, NpcWalk::Arrived(_))) && !other_walk {
+            dev.script_keys.retain(|c| c != 'W');
+        }
+    }
+    if let NpcWalk::Arrived(npc) = step {
+        dispatch_talk(&bridge.0, npc, target.obj_id);
+    }
 }
 
 pub(super) fn talk_pointer(
@@ -865,6 +1323,125 @@ pub(super) fn talk_pointer(
     }
 }
 
+/// `FUN_3937b240` from `SCQuestContextStarted` / `SCQuestContextUpdated`: the clock's end is the
+/// server's `time_left_ms` at local receipt, and a later Started / Updated releases the refusal
+/// latch so the tick may keep it.
+fn start_quest_clock(bridge: &Shared, q: &Quest, end_ms: i32, now: Instant) {
+    let mut d = bridge.borrow_mut();
+    d.dialog.cleared_left.remove(&(q.template_id, q.id));
+    d.dialog.seeded_left.insert((q.template_id, q.id));
+    d.dialog.left_times.insert(q.template_id, QuestClock { end_ms, started: now });
+}
+
+/// `FUN_3937a130`'s refusal path: end the window showing `quest_id`, clear its clock, latch the
+/// instance so the tick does not restore it, and say whether a clock was cleared.
+fn refuse_quest(rt: &UiRuntime, bridge: &Shared, quest_id: u32) -> bool {
+    let mut d = bridge.borrow_mut();
+    if d.dialog.directing && d.dialog.quest == Some(quest_id) {
+        apply_directing(rt, &mut d.dialog, false);
+    }
+    let instance = d.dialog.quests.iter().find(|q| q.template_id == quest_id).map(|q| q.id);
+    if let Some(id) = instance {
+        d.dialog.cleared_left.insert((quest_id, id));
+    }
+    d.dialog.left_times.remove(&quest_id).is_some()
+}
+
+/// The quest packets that are notices rather than quest state: a refused request
+/// (`SCQuestContextFailed`), a needed unit gone (`SCQuestUnitReqFailed`) and quest mail
+/// (`SCQuestMailSent`, `SCQuestRewardedByMail`).
+///
+/// `FUN_391dbcd0` raises `QUEST_ERROR_INFO(err, qtype)` and `FUN_3937a130` first clears the quest's
+/// timer (`FUN_39379ea0` publishes `QUEST_LEFT_TIME_UPDATED(qtype, 0)`); the directing script ends
+/// its window when the event's quest is the one it shows (`quest_context_directing.alb` F37).
+/// `FUN_391dbdd0` raises `QUEST_QUICK_CLOSE_EVENT(qtype)` only when the failed unit is the current
+/// target (`FUN_39376590`); the directing script closes the same window (F36). The mail packets
+/// show the `QUEST_MAIL_SENT` / `QUEST_REWARDED_BY_MAIL` texts through `DOODAD_PHASE_MSG`
+/// (`FUN_3937a650`, `FUN_3937a520`), with the `quest_mails` name / the quest title as `$1`; a
+/// failed reward mail (`success` 0) is `FUN_3937a130(qtype, 0xb)` instead.
+pub fn route_quest_notices(
+    rt: Option<NonSend<UiRuntime>>,
+    bridge: NonSend<HudBridge>,
+    target: Res<Target>,
+    mut events: MessageReader<NetEvent>,
+    mut skill_failed: MessageWriter<super::alerts::UseFailed>,
+) {
+    let Some(rt) = rt else { return };
+    for NetEvent(e) in events.read() {
+        match e {
+            Event::QuestStarted(q) => start_quest_clock(&bridge.0, q, q.time_left_ms, Instant::now()),
+            Event::QuestUpdated(q) => {
+                // 723452: a status other than in progress calls FUN_3937b240(qtype, -1), which the
+                // next tick removes and publishes as (qtype, 0).
+                let end_ms = if q.status == status::PROGRESS { q.time_left_ms } else { -1 };
+                start_quest_clock(&bridge.0, q, end_ms, Instant::now());
+            }
+            Event::QuestContextFailed(failed) => {
+                let had_timer = refuse_quest(&rt, &bridge.0, failed.quest_id);
+                info!("hud: quest {} failed ({})", failed.quest_id, failed.err);
+                // FUN_3937a130 clears the quest's timer before raising the error.
+                if had_timer {
+                    rt.fire_event("QUEST_LEFT_TIME_UPDATED", (failed.quest_id, 0i32));
+                }
+                rt.fire_event("QUEST_ERROR_INFO", (u32::from(failed.err), failed.quest_id));
+            }
+            Event::QuestUnitReqFailed(failed) => {
+                if target.obj_id != Some(failed.unit_obj_id) {
+                    continue;
+                }
+                {
+                    let mut d = bridge.0.borrow_mut();
+                    if d.dialog.directing && d.dialog.quest == Some(failed.quest_id) {
+                        apply_directing(&rt, &mut d.dialog, false);
+                    }
+                }
+                info!("hud: quest {} needs unit {} (result {:?})", failed.quest_id, failed.unit_obj_id, failed.result);
+                // FUN_39376590 reports the result through FUN_39390900 before it raises 0xf4.
+                // The cooldown-detail silence (FUN_39390900:742294) is inside the skill-lookup
+                // branch, and FUN_39376590 passes the no-skill sentinel DAT_3a173784 (718029), so
+                // it does not apply here.
+                let result = failed.result.code;
+                let value = if failed.result.raw_flags & 4 != 0 { failed.result.value } else { u32::from(failed.result.extra) };
+                skill_failed.write(super::alerts::UseFailed { skill: 0, result, value, server: true });
+                rt.fire_event("QUEST_QUICK_CLOSE_EVENT", failed.quest_id);
+            }
+            Event::QuestMailSent(sent) => {
+                // FUN_3937a650: the quest_mails row's name (FUN_398562a0 -> +4) is the $1 of
+                // QUEST_MAIL_SENT; a missing row shows nothing.
+                let name = bridge.0.borrow().game.get().and_then(|game| game.quests.quest_mail_names.get(&sent.id)).cloned();
+                let Some(name) = name else { continue };
+                let Some(text) = super::alerts::localized_args(&rt, "ERROR_MSG", "QUEST_MAIL_SENT", std::slice::from_ref(&name)) else { continue };
+                info!("hud: quest mail {} sent: {text}", sent.id);
+                rt.fire_event("DOODAD_PHASE_MSG", text);
+            }
+            Event::Interaction(InteractEvent::RewardedByMail { success, quest }) => {
+                if !success {
+                    // FUN_3937a520(0, qtype) -> FUN_3937a130(qtype, 0xb).
+                    let had_timer = refuse_quest(&rt, &bridge.0, *quest);
+                    info!("hud: quest {quest} reward mail failed");
+                    if had_timer {
+                        rt.fire_event("QUEST_LEFT_TIME_UPDATED", (*quest, 0i32));
+                    }
+                    rt.fire_event("QUEST_ERROR_INFO", (0xb_u32, *quest));
+                    continue;
+                }
+                // FUN_3937a520: the quest's title (+0x20) is the $1 of QUEST_REWARDED_BY_MAIL; a
+                // quest missing from the table shows nothing.
+                let title = {
+                    let d = bridge.0.borrow();
+                    let Some(game) = d.game.get() else { continue };
+                    let Some(def) = game.quests.def(*quest) else { continue };
+                    texts(&d, game).expand(&def.name)
+                };
+                let Some(text) = super::alerts::localized_args(&rt, "ERROR_MSG", "QUEST_REWARDED_BY_MAIL", std::slice::from_ref(&title)) else { continue };
+                info!("hud: quest {quest} rewarded by mail: {text}");
+                rt.fire_event("DOODAD_PHASE_MSG", text);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The cinema of the quest's `kind` component (`quest_components.cinema_id`).
 fn component_cinema(game: &GameData, quest: u32, kind: u8) -> Option<(u32, CinemaDef)> {
     let def = game.quests.def(quest)?;
@@ -880,6 +1457,42 @@ fn directing_cinema(d: &HudData, game: &GameData, quest: u32, kind: u8) -> Optio
     component_cinema(game, quest, kind)
 }
 
+/// The world state the dialog reads: the units the close-up frames and the quests a hand-in checks.
+#[derive(SystemParam)]
+pub struct DialogWorld<'w> {
+    units: Res<'w, Units>,
+    quests: Res<'w, Quests>,
+    doodads: Res<'w, Doodads>,
+}
+
+/// `FUN_3937a130`: the original reports a refused quest request as `QUEST_ERROR_INFO(error, quest)`;
+/// the quest scripts turn the code into their localized line.
+fn quest_error(rt: Option<&UiRuntime>, quest: u32, error: u32) {
+    warn!("hud: quest {quest} refused with error {error}");
+    if let Some(rt) = rt {
+        rt.fire_event("QUEST_ERROR_INFO", (error, quest));
+    }
+}
+
+/// `FUN_393761f0`: a hand-in at an object needs that NPC or doodad in the interaction reach.
+fn hand_in_target_ok(d: &HudData, world: &DialogWorld, npc_obj_id: u32, doodad_obj_id: u32) -> bool {
+    if npc_obj_id != 0 {
+        let Some(unit) = world.units.get(npc_obj_id) else { return false };
+        let at = Vec3::new(unit.pos.x, unit.pos.y, unit.pos.z);
+        if !npc_in_reach(d, d.pos, at, unit) {
+            return false;
+        }
+    }
+    if doodad_obj_id != 0 {
+        let Some(doodad) = world.doodads.by_id.get(&doodad_obj_id) else { return false };
+        let Some(at) = doodad_world(doodad, &world.units) else { return false };
+        if d.pos.distance(at) > INTERACT_REACH {
+            return false;
+        }
+    }
+    true
+}
+
 /// The scripts' requests become packets; the dialog hides the HUD and brings it back. A doodad's quest
 /// offer (`SCDoodadQuestAccept`, when the player used a notice board ...) opens the dialog on it.
 pub fn handle_dialog(
@@ -887,7 +1500,7 @@ pub fn handle_dialog(
     bridge: NonSend<HudBridge>,
     mut events: MessageReader<NetEvent>,
     mut net: MessageWriter<NetCommand>,
-    units: Res<Units>,
+    world: DialogWorld,
     mut camera: Option<ResMut<QuestTalkCamera>>,
     mut cinema: Option<ResMut<super::cinema::CinemaPlayer>>,
 ) {
@@ -907,9 +1520,30 @@ pub fn handle_dialog(
                 rt.fire_event("START_QUEST_CONTEXT_DOODAD", (*quest_id, true, doodad_obj_id.to_string()));
             }
         }
+        if let Event::Interaction(InteractEvent::DoodadCompleteQuest { doodad_obj_id, quest_id }) = e
+            && let Some(rt) = rt.as_deref()
+        {
+            // The event flag is `FUN_397d42d0` of the quest's Ready component: true when it has a
+            // report act (QuestActConReportNpc 0x14 / QuestActConReportDoodad 0x15), which opens the
+            // directing dialog; false completes directly through quest_context.alb.
+            let can_complete = bridge.0.borrow().game.get().is_some_and(|g| g.quests.ready_has_report(*quest_id));
+            let directing = {
+                let mut d = bridge.0.borrow_mut();
+                if !d.dialog.directing {
+                    d.dialog.doodad = Some(*doodad_obj_id);
+                    d.dialog.npc = None;
+                }
+                d.dialog.directing
+            };
+            if !directing {
+                info!("hud: doodad {doodad_obj_id} completes quest {quest_id}");
+                rt.fire_event("COMPLETE_QUEST_CONTEXT_DOODAD", (*quest_id, can_complete, doodad_obj_id.to_string()));
+            }
+        }
     }
     let mut d = bridge.0.borrow_mut();
     let requests = std::mem::take(&mut d.dialog.requests);
+    let mut errors = Vec::new();
     for r in requests {
         let r = if let Req::AtNpc(scope, request) = r {
             if !scope_current(&d, scope) {
@@ -942,6 +1576,33 @@ pub fn handle_dialog(
                 }
             }
             Req::Complete(quest_id, selected) => {
+                // `FUN_3937b860`: a Reward step with a selective item needs the chosen reward; a
+                // ready quest needs its NPC/doodad in reach; an in-progress let-it-done quest goes
+                // out as 0x0dd with the NPC object; anything else is refused with error 0xc.
+                let Some(game) = d.game.get() else {
+                    errors.push((quest_id, 2));
+                    continue;
+                };
+                let Some(q) = world.quests.active_quest(quest_id) else {
+                    errors.push((quest_id, 2));
+                    continue;
+                };
+                if selected == 0 && game.quests.parts_of(quest_id, kind::REWARD).flat_map(|c| &c.acts).any(|a| a.ty == "SupplySelectiveItem") {
+                    errors.push((quest_id, 10));
+                    continue;
+                }
+                if q.status == status::READY {
+                    if !hand_in_target_ok(&d, &world, npc_obj_id, doodad_obj_id) {
+                        errors.push((quest_id, 2));
+                        continue;
+                    }
+                } else if game.quests.is_let_it_done(q) {
+                    send(&mut net, Interact::TryQuestCompleteAsLetItDone { quest_id, obj_id: npc_obj_id, selected });
+                    continue;
+                } else {
+                    errors.push((quest_id, 12));
+                    continue;
+                }
                 let then = Interact::QuestComplete { quest_id, npc_obj_id, doodad_obj_id, selected };
                 let started = match (cinema.as_deref_mut(), d.game.get().and_then(|g| directing_cinema(&d, g, quest_id, kind::READY))) {
                     (Some(player), Some((component_id, cinema_def))) => super::cinema::start_quest_cinema(
@@ -953,6 +1614,36 @@ pub fn handle_dialog(
                 };
                 if !started {
                     send(&mut net, then);
+                }
+            }
+            Req::CompleteContext { quest, selected, source } => {
+                let (npc_obj_id, doodad_obj_id) = match source {
+                    Some(CompleteSource::Npc(id)) => (id, 0),
+                    Some(CompleteSource::Doodad(id)) => (0, id),
+                    None => (0, 0),
+                };
+                let Some(game) = d.game.get() else {
+                    errors.push((quest, 2));
+                    continue;
+                };
+                let Some(q) = world.quests.active_quest(quest) else {
+                    errors.push((quest, 2));
+                    continue;
+                };
+                if selected == 0 && game.quests.parts_of(quest, kind::REWARD).flat_map(|c| &c.acts).any(|a| a.ty == "SupplySelectiveItem") {
+                    errors.push((quest, 10));
+                    continue;
+                }
+                if q.status == status::READY {
+                    if !hand_in_target_ok(&d, &world, npc_obj_id, doodad_obj_id) {
+                        errors.push((quest, 2));
+                        continue;
+                    }
+                    send(&mut net, Interact::QuestComplete { quest_id: quest, npc_obj_id, doodad_obj_id, selected });
+                } else if game.quests.is_let_it_done(q) {
+                    send(&mut net, Interact::TryQuestCompleteAsLetItDone { quest_id: quest, obj_id: npc_obj_id, selected });
+                } else {
+                    errors.push((quest, 12));
                 }
             }
             Req::CinemaPermission { quest, kind } => {
@@ -970,7 +1661,9 @@ pub fn handle_dialog(
                     }
                 }
             }
-            Req::Talk(quest_id, component_id, act_id) => send(&mut net, Interact::QuestTalk { npc_obj_id, quest_id, component_id, act_id }),
+            Req::Talk(quest_id, component_id, act_id) => {
+                send(&mut net, Interact::QuestTalk { npc_obj_id, quest_id, component_id, act_id });
+            }
             Req::AtNpc(..) => unreachable!("NPC request is unwrapped once"),
             Req::Drop(quest_id) => send(&mut net, Interact::QuestDrop { quest_id }),
             Req::End => end_talk(&mut d, &mut net),
@@ -994,7 +1687,7 @@ pub fn handle_dialog(
                 // no speaker found leaves the close-up (`quest_camera::leave`)
                 if let Some(camera) = camera.as_deref_mut() {
                     let previous = camera.frame;
-                    camera.frame = framing(&d, &units, bubble, previous.as_ref());
+                    camera.frame = framing(&d, &world.units, bubble, previous.as_ref());
                 }
             }
         }
@@ -1013,10 +1706,16 @@ pub fn handle_dialog(
     {
         hide_others(rt, &mut d.dialog);
     }
+    // Event handlers call back into the HUD (including closing the directing window).
+    drop(d);
+    for (quest, error) in errors {
+        quest_error(rt.as_deref(), quest, error);
+    }
 }
 
 fn end_talk(d: &mut HudData, _net: &mut MessageWriter<NetCommand>) {
     d.dialog.doodad = None;
+    d.dialog.quest = None;
     if let Some(scope) = active_scope(d).or_else(|| npc::cancel_scope(d)) { close_npc(d, scope); }
     d.dialog.start.clear(); d.dialog.complete.clear(); d.dialog.talk.clear();
 }
@@ -1024,6 +1723,9 @@ fn end_talk(d: &mut HudData, _net: &mut MessageWriter<NetCommand>) {
 /// The dialog has the screen to itself: every other top-level widget is hidden while it is up (the
 /// original hides the UI layers below its own) and the ones that were shown come back after.
 fn apply_directing(rt: &UiRuntime, dialog: &mut DialogView, on: bool) {
+    if !on {
+        dialog.quest = None;
+    }
     if dialog.directing == on {
         return;
     }
@@ -1126,7 +1828,8 @@ fn reset(bridge: NonSend<HudBridge>, camera: Option<ResMut<QuestTalkCamera>>) {
 pub fn plugin(app: &mut App) {
     app.add_systems(Update, npc::track_npc.before(aa_ui::UiInput).before(super::sync_hud).before(super::prebuild_hud).before(super::build_hud));
     app.insert_resource(ScriptedTalk::from_args()).add_systems(OnExit(crate::Screen::InGame), reset)
-        .add_systems(Update, talk_pointer.after(super::PointerFinished).after(talk_input).run_if(super::hud_up).run_if(in_state(crate::Screen::InGame)));
+        .add_systems(Update, walk_to_npc.after(talk_input).before(talk_pointer).run_if(super::hud_up).run_if(in_state(crate::Screen::InGame)))
+        .add_systems(Update, talk_pointer.after(super::PointerFinished).after(walk_to_npc).run_if(super::hud_up).run_if(in_state(crate::Screen::InGame)));
 }
 
 #[cfg(test)]
@@ -1169,7 +1872,7 @@ mod tests {
             template_id: 7,
             owner_id: 0,
         };
-        npc.pos = aa_net::Pos::new(105.0, 100.0, 0.0);
+        npc.pos = aa_net::Pos::new(102.0, 100.0, 0.0);
         let mut units = Units::default();
         units.by_id.insert(slave.obj_id, slave);
         units.by_id.insert(npc.obj_id, npc);
@@ -1214,6 +1917,143 @@ mod tests {
             None,
             "the stale HUD point would be 105 m away"
         );
+        // `drive_npc` uses the same seat point (not the stale `data.pos`) for its late range rejection.
+        let npc_unit = units.get(21).unwrap();
+        assert!(npc_in_reach(
+            &state.borrow(),
+            me,
+            Vec3::new(102.0, 100.0, 0.0),
+            npc_unit
+        ));
+        assert!(!npc_in_reach(
+            &state.borrow(),
+            state.borrow().pos,
+            Vec3::new(102.0, 100.0, 0.0),
+            npc_unit
+        ));
+    }
+
+    #[test]
+    fn a_climb_doodad_keeps_the_click_only_in_front_of_a_unit() {
+        assert!(
+            crate::hud::pick::doodad_beats_unit(Some((3.0, 77)), Some((5.0, 20)), None),
+            "ladder in front"
+        );
+        assert!(
+            crate::hud::pick::doodad_beats_unit(Some((3.0, 77)), None, None),
+            "no unit behind"
+        );
+        assert!(
+            !crate::hud::pick::doodad_beats_unit(Some((5.0, 77)), Some((3.0, 20)), None),
+            "a nearer unit or the hull keeps the right click"
+        );
+        assert!(
+            !crate::hud::pick::doodad_beats_unit(None, Some((3.0, 20)), None),
+            "no ladder"
+        );
+    }
+
+    /// A ladder parented to the ship beats the ship's loose box (the box is the union of every
+    /// drawn mesh, so its entry is outside the hull); a ray away from the ladder still picks the
+    /// ship. Uses a real [`super::pick::PickBox`] for the hull.
+    #[test]
+    fn a_ladder_on_the_hull_beats_the_ships_loose_box() {
+        let mut hull = crate::hud::expansion::fixture::spawn().unit;
+        hull.obj_id = 20;
+        hull.kind = aa_net::model::UnitKind::Slave {
+            id: 700,
+            tl_id: 8,
+            template_id: 21,
+            summoner_id: 100,
+        };
+        hull.scale = 1.0;
+        let boxed = crate::hud::pick::PickBox {
+            centre: Vec3::new(0.0, 1.5, 0.0),
+            // masts and sails protrude past the hull side, as the loose union box does
+            half: Vec3::new(12.0, 1.5, 3.0),
+            rotation: Quat::IDENTITY,
+        };
+        // from outside the port side, above the 1.1 m sphere: the box entry is at x 12, the
+        // middle at x 0; the ladder sits on the side at x -10.1.
+        let ray = Ray3d::new(
+            Vec3::new(20.0, 3.0, 0.0),
+            bevy::math::Dir3::NEG_X,
+        );
+        let mut units = Units::default();
+        units.by_id.insert(20, hull.clone());
+        let (entry, id) = crate::hud::pick::pick_unit_hit(
+            &ray,
+            &units,
+            0,
+            None,
+            |_| true,
+            |_, _| (None, Some(boxed)),
+        )
+        .expect("the hull box is under the ray");
+        assert_eq!(id, 20);
+        let unit_along = crate::hud::pick::unit_compare_hit(&ray, &hull, None, Some(boxed))
+            .expect("the hull box is under the ray");
+        let ladder_along = 20.0 - 10.1;
+        assert!(
+            entry < ladder_along,
+            "the loose box entry {entry} is in front of the ladder"
+        );
+        // like for like: the entry is in front of the ladder, the box middle is behind it
+        assert!(!crate::hud::pick::doodad_beats_unit(
+            Some((ladder_along, 77)),
+            Some((entry, 20)),
+            None
+        ));
+        assert!(
+            crate::hud::pick::doodad_beats_unit(
+                Some((ladder_along, 77)),
+                Some((unit_along, 20)),
+                None
+            ),
+            "the ladder is in front of the box middle (ladder {ladder_along}, middle {unit_along})"
+        );
+        // a ladder behind the box middle still beats the hull it is attached to
+        let mut doodads = Doodads::default();
+        doodads.by_id.insert(
+            77,
+            aa_net::model::Doodad {
+                obj_id: 77,
+                template_id: 1187,
+                owner_obj_id: 0,
+                parent_obj_id: 20,
+                attach_point: 24,
+                pos: aa_net::Pos::new(0.0, 0.0, 0.0),
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: 1.0,
+                has_loot_item: false,
+                func_group_id: 15013,
+                owner_id: 0,
+                ucc_id: 0,
+                item_template_id: 0,
+                type2: 0,
+                time_left: 0,
+                plant_time: 0,
+                quest_glow: 0,
+                family: 0,
+                puzzle_group: 0,
+                owner_type: 0,
+                owner_db_id: 0,
+                data: 0,
+            },
+        );
+        let parent = parent_of_climb(&doodads, Some((30.0, 77)));
+        assert_eq!(parent, Some(20), "the ladder parent comes from Doodads");
+        assert!(crate::hud::pick::doodad_beats_unit(
+            Some((30.0, 77)),
+            Some((unit_along, 20)),
+            parent
+        ));
+        // the same click away from the ladder has no doodad hit: the ship stays the pick
+        assert!(!crate::hud::pick::doodad_beats_unit(
+            None,
+            Some((unit_along, 20)),
+            None
+        ));
     }
 
     #[test]
@@ -1238,6 +2078,8 @@ mod tests {
         app.add_message::<NetEvent>()
             .add_message::<NetCommand>()
             .init_resource::<Units>()
+            .init_resource::<Quests>()
+            .init_resource::<Doodads>()
             .init_resource::<super::super::cinema::CinemaPlayer>()
             .insert_non_send(HudBridge(shared))
             .add_systems(Update, handle_dialog);
@@ -1256,6 +2098,379 @@ mod tests {
             ],
             "the {} movie must start after 0x0d0 at the dialog open",
             cinema.name
+        );
+    }
+
+    /// The scripts' side of a quest window with no UI stage: the HUD functions and `quest.lua`
+    /// loaded into a bare runtime.
+    fn bare_runtime(shared: &Shared) -> UiRuntime {
+        let rt = UiRuntime::new("en_us", 1280.0, 720.0).unwrap();
+        rt.lua
+            .load("X2Quest = {}; X2Decal = {}; X2 = {}; X2Util = {}; X2Interaction = {}")
+            .set_name("@quest-native-stubs")
+            .exec()
+            .unwrap();
+        let hud = rt.lua.create_table().unwrap();
+        super::install(&rt.lua, &hud, shared).unwrap();
+        rt.lua.globals().set("HUD", hud).unwrap();
+        super::load_script(&rt.lua).unwrap();
+        rt
+    }
+
+    fn handle_dialog_app(shared: Shared, rt: UiRuntime) -> App {
+        let mut app = App::new();
+        app.add_message::<NetEvent>()
+            .add_message::<NetCommand>()
+            .init_resource::<Units>()
+            .init_resource::<Quests>()
+            .init_resource::<Doodads>()
+            .init_resource::<super::super::cinema::CinemaPlayer>()
+            .insert_non_send(HudBridge(shared))
+            .insert_non_send(rt)
+            .add_systems(Update, handle_dialog);
+        app
+    }
+
+    fn sent_requests(app: &mut App) -> Vec<Interact> {
+        app.world_mut()
+            .resource_mut::<Messages<NetCommand>>()
+            .drain()
+            .filter_map(|NetCommand(command)| if let Command::Interact(packet) = command { Some(packet) } else { None })
+            .collect()
+    }
+
+    #[test]
+    fn the_quest_getters_read_the_computed_rows() {
+        if !aa_cry::pak_available() {
+            return;
+        }
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        let rt = bare_runtime(&shared);
+        rt.lua
+            .load(
+                r#"
+                HUD.quest_version = function() return 1 end
+                HUD.quest_list = function() return {
+                    { type = 11, letItDone = true, overDone = false, objectives = {} },
+                    { type = 12, letItDone = false, overDone = true, objectives = {} },
+                } end
+                assert(X2Quest:IsLetItDoneQuest(1))
+                assert(not X2Quest:IsOverDoneQuest(1))
+                assert(not X2Quest:IsLetItDoneQuestByType(12))
+                assert(X2Quest:IsOverDoneQuestByType(12))
+                assert(not X2Quest:IsLetItDoneQuestByType(13))
+                "#,
+            )
+            .set_name("@quest-getters-test")
+            .exec()
+            .unwrap();
+    }
+
+    /// The real World-stage scripts (`quest_context.alb`, `quest_context_directing.alb`) over the
+    /// HUD API. Needs the pak and the game database.
+    fn world_runtime(shared: &Shared) -> Option<UiRuntime> {
+        if !aa_world::pak_available() {
+            return None;
+        }
+        let path = std::env::var("AA_DB").unwrap_or_else(|_| aa_anim::db::DEFAULT_DB.to_string());
+        let game = GameData::load(&path).ok()?;
+        {
+            let mut d = shared.borrow_mut();
+            d.game = super::super::SharedGameData::default();
+            d.game.0.set(game).ok()?;
+        }
+        let mut rt = UiRuntime::new("en_us", 1280.0, 720.0).ok()?;
+        rt.load_ui_texts(std::path::Path::new(&path)).ok()?;
+        super::super::api::install(&mut rt, shared).ok()?;
+        rt.run_stage(aa_ui::Stage::World);
+        super::super::api::enter_world(&rt, shared, &aa_net::state::Chat::default());
+        Some(rt)
+    }
+
+    #[test]
+    fn a_doodad_completion_fires_the_event_and_sends_the_doodad_id() {
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        let Some(rt) = world_runtime(&shared) else { return };
+        // Adventure quest 2563 is handed in at doodad 3020 (a QuestActConReportDoodad Ready act).
+        let (q, doodad) = {
+            let d = shared.borrow();
+            let g = d.game.get().expect("the World runtime loaded the game data");
+            let ready = g.quests.parts_of(2563, kind::READY).next().expect("quest 2563 has a Ready step");
+            assert!(g.quests.ready_has_report(2563), "2563's Ready act is a report act");
+            let q = Quest { template_id: 2563, status: status::READY, component_id: ready.id, ..Quest::default() };
+            let doodad = aa_net::model::Doodad {
+                obj_id: 0x201,
+                template_id: 3020,
+                owner_obj_id: 0,
+                parent_obj_id: 0,
+                attach_point: 0,
+                pos: aa_net::Pos::new(0.0, 0.0, 0.0),
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: 1.0,
+                has_loot_item: false,
+                func_group_id: 0,
+                owner_id: 0,
+                ucc_id: 0,
+                item_template_id: 0,
+                type2: 0,
+                time_left: 0,
+                plant_time: 0,
+                quest_glow: 0,
+                family: 0,
+                puzzle_group: 0,
+                owner_type: 0,
+                owner_db_id: 0,
+                data: 0,
+            };
+            (q, doodad)
+        };
+        shared.borrow_mut().dialog.quests = vec![q.clone()];
+        let mut app = handle_dialog_app(shared.clone(), rt);
+        app.insert_resource(Quests { active: vec![q], ..Quests::default() });
+        let mut doodads = Doodads::default();
+        doodads.by_id.insert(0x201, doodad);
+        app.insert_resource(doodads);
+
+        app.world_mut().write_message(NetEvent(Event::Interaction(InteractEvent::DoodadCompleteQuest {
+            doodad_obj_id: 0x201,
+            quest_id: 2563,
+        })));
+        app.update();
+        assert!(shared.borrow().dialog.directing, "the report act opens the directing dialog");
+        assert!(sent_requests(&mut app).is_empty(), "the report act does not complete at once");
+
+        // End the directing window's fade so its fade-end callback runs TryCompleteQuestContext,
+        // then click the original window's confirm button (quest_context_directing.alb F16).
+        for _ in 0..2 {
+            aa_ui::lua::tick(&app.world().non_send::<UiRuntime>().lua, 10_000.0);
+        }
+        app.update();
+        app.world()
+            .non_send::<UiRuntime>()
+            .lua
+            .load("local w = ADDON:GetContent(UIC_QUEST_CINEMA_WND); assert(w ~= nil); local b = w.journal.button; assert(b and b.OnClick ~= nil); b.OnClick(b, 'LeftButton')")
+            .set_name("@quest-doodad-confirm-test")
+            .exec()
+            .unwrap();
+        app.update();
+        assert_eq!(
+            sent_requests(&mut app),
+            [Interact::QuestComplete { quest_id: 2563, npc_obj_id: 0, doodad_obj_id: 0x201, selected: 0 }]
+        );
+    }
+
+    #[test]
+    fn a_doodad_completion_without_a_report_act_completes_directly() {
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        let Some(rt) = world_runtime(&shared) else { return };
+        // Quest 182's Ready step is a QuestActConReportJournal, so FUN_397d42d0 is false.
+        let (q, doodad) = {
+            let d = shared.borrow();
+            let g = d.game.get().expect("the World runtime loaded the game data");
+            let ready = g.quests.parts_of(182, kind::READY).next().expect("quest 182 has a Ready step");
+            assert!(!g.quests.ready_has_report(182));
+            let q = Quest { template_id: 182, status: status::READY, component_id: ready.id, ..Quest::default() };
+            let doodad = aa_net::model::Doodad {
+                obj_id: 0x201,
+                template_id: 3020,
+                owner_obj_id: 0,
+                parent_obj_id: 0,
+                attach_point: 0,
+                pos: aa_net::Pos::new(0.0, 0.0, 0.0),
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: 1.0,
+                has_loot_item: false,
+                func_group_id: 0,
+                owner_id: 0,
+                ucc_id: 0,
+                item_template_id: 0,
+                type2: 0,
+                time_left: 0,
+                plant_time: 0,
+                quest_glow: 0,
+                family: 0,
+                puzzle_group: 0,
+                owner_type: 0,
+                owner_db_id: 0,
+                data: 0,
+            };
+            (q, doodad)
+        };
+        shared.borrow_mut().dialog.quests = vec![q.clone()];
+        let mut app = handle_dialog_app(shared.clone(), rt);
+        app.insert_resource(Quests { active: vec![q], ..Quests::default() });
+        let mut doodads = Doodads::default();
+        doodads.by_id.insert(0x201, doodad);
+        app.insert_resource(doodads);
+
+        app.world_mut().write_message(NetEvent(Event::Interaction(InteractEvent::DoodadCompleteQuest {
+            doodad_obj_id: 0x201,
+            quest_id: 182,
+        })));
+        app.update();
+        assert!(!shared.borrow().dialog.directing, "without a report act the hand-in completes directly");
+        assert_eq!(
+            sent_requests(&mut app),
+            [Interact::QuestComplete { quest_id: 182, npc_obj_id: 0, doodad_obj_id: 0x201, selected: 0 }]
+        );
+    }
+
+    /// Loads the game database into `shared` (the bare runtime's `HUD.quest_info`, rewards and the
+    /// hand-in checks need it). Skips when the database is not there.
+    fn with_game(shared: &Shared) -> bool {
+        let path = std::env::var("AA_DB").unwrap_or_else(|_| aa_anim::db::DEFAULT_DB.to_string());
+        let Ok(game) = GameData::load(&path) else { return false };
+        let mut d = shared.borrow_mut();
+        d.game = super::super::SharedGameData::default();
+        d.game.0.set(game).is_ok()
+    }
+
+    fn error_probe(rt: &UiRuntime) {
+        rt.exec(
+            "probe",
+            r#"
+            ERRORS = {}
+            local w = UIParent:CreateWidget('emptywidget', 'questErrorProbe', 'UIParent')
+            w:RegisterEvent('QUEST_ERROR_INFO')
+            w:SetHandler('OnEvent', function(_, _, code, quest)
+              assert(type(HUD.quest_version()) == 'number', 'error handlers may query the HUD')
+              ERRORS = { code, quest }
+            end)
+            "#,
+        )
+        .unwrap();
+    }
+
+    fn assert_error(app: &App, expected: u32) {
+        app.world()
+            .non_send::<UiRuntime>()
+            .lua
+            .load(format!("assert(ERRORS[1] == {expected} and ERRORS[2] ~= nil, tostring(ERRORS[1]))"))
+            .set_name("@quest-error-test")
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn an_in_progress_quest_that_is_not_let_it_done_is_refused() {
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        if !with_game(&shared) { return; }
+        assert!(!shared.borrow().game.get().unwrap().quests.def(330).unwrap().let_it_done);
+        let rt = bare_runtime(&shared);
+        error_probe(&rt);
+        let mut app = handle_dialog_app(shared, rt);
+        app.insert_resource(Quests {
+            active: vec![Quest { template_id: 330, status: status::PROGRESS, ..Quest::default() }],
+            ..Quests::default()
+        });
+        app.world()
+            .non_send::<UiRuntime>()
+            .lua
+            .load("X2Quest:TryCompleteQuestContext(0, 330, '', '', 0)")
+            .exec()
+            .unwrap();
+        app.update();
+        assert!(sent_requests(&mut app).is_empty(), "error 0xc sends nothing");
+        assert_error(&app, 12);
+    }
+
+    #[test]
+    fn a_ready_hand_in_needs_its_doodad_in_reach() {
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        if !with_game(&shared) { return; }
+        let ready = {
+            let d = shared.borrow();
+            let g = d.game.get().unwrap();
+            g.quests.parts_of(2563, kind::READY).next().unwrap().id
+        };
+        let rt = bare_runtime(&shared);
+        error_probe(&rt);
+        let mut app = handle_dialog_app(shared, rt);
+        app.insert_resource(Quests {
+            active: vec![Quest { template_id: 2563, status: status::READY, component_id: ready, ..Quest::default() }],
+            ..Quests::default()
+        });
+        app.world()
+            .non_send::<UiRuntime>()
+            .lua
+            .load("X2Quest:TryCompleteQuestContext(2, 2563, '513', '', 0)")
+            .exec()
+            .unwrap();
+        app.update();
+        assert!(sent_requests(&mut app).is_empty(), "error 2 sends nothing");
+        assert_error(&app, 2);
+    }
+
+    #[test]
+    fn a_selective_reward_must_be_chosen() {
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        if !with_game(&shared) { return; }
+        assert!(
+            shared
+                .borrow()
+                .game
+                .get()
+                .unwrap()
+                .quests
+                .parts_of(13, kind::REWARD)
+                .flat_map(|c| &c.acts)
+                .any(|a| a.ty == "SupplySelectiveItem")
+        );
+        let rt = bare_runtime(&shared);
+        error_probe(&rt);
+        let mut app = handle_dialog_app(shared, rt);
+        app.insert_resource(Quests {
+            active: vec![Quest { template_id: 13, status: status::READY, ..Quest::default() }],
+            ..Quests::default()
+        });
+        app.world()
+            .non_send::<UiRuntime>()
+            .lua
+            .load("X2Quest:TryCompleteQuestContext(0, 13, '', '', 0)")
+            .exec()
+            .unwrap();
+        app.update();
+        assert!(sent_requests(&mut app).is_empty(), "error 10 sends nothing");
+        assert_error(&app, 10);
+    }
+
+    #[test]
+    fn a_let_it_done_quest_completes_from_the_journal_without_an_npc() {
+        if !aa_world::pak_available() {
+            return;
+        }
+        let path = std::env::var("AA_DB").unwrap_or_else(|_| aa_anim::db::DEFAULT_DB.to_string());
+        let Ok(game) = GameData::load(&path) else { return };
+        let Some(def) = game.quests.def(1025) else { return };
+        assert!(def.let_it_done && !def.is_main(), "quest 1025 is a let-it-done side quest");
+        let mut q = Quest { template_id: 1025, status: status::PROGRESS, ..Quest::default() };
+        let Some(progress) = game.quests.parts_of(1025, kind::PROGRESS).next() else { return };
+        q.component_id = progress.id;
+        for a in &progress.acts {
+            if let Some(i) = a.objective {
+                q.objectives[usize::from(i)] = a.count / 2;
+            }
+        }
+        assert!(game.quests.is_let_it_done(&q), "half the objectives are enough for the original");
+
+        let shared: Shared = std::rc::Rc::new(std::cell::RefCell::new(HudData::default()));
+        {
+            let mut d = shared.borrow_mut();
+            d.game = super::super::SharedGameData::default();
+            let _ = d.game.0.set(game);
+        }
+        let rt = bare_runtime(&shared);
+        rt.lua
+            .load("X2Quest:TryCompleteQuestContext(0, 1025, '', '', 0)")
+            .set_name("@quest-journal-complete-test")
+            .exec()
+            .unwrap();
+        let mut app = handle_dialog_app(shared, rt);
+        app.insert_resource(Quests { active: vec![q], ..Quests::default() });
+        app.update();
+        assert_eq!(
+            sent_requests(&mut app),
+            [Interact::TryQuestCompleteAsLetItDone { quest_id: 1025, obj_id: 0, selected: 0 }]
         );
     }
 
@@ -1280,5 +2495,774 @@ mod tests {
         d.dialog.directing = true;
         assert!(directing_cinema(&d, &game, 1065, kind::READY).is_some());
         assert!(directing_cinema(&d, &game, 1065, kind::START).is_none());
+    }
+
+    fn npc(obj_id: u32, template_id: u32, x: f32) -> Unit {
+        let mut unit = crate::hud::fixture_spawn().unit;
+        unit.obj_id = obj_id;
+        unit.kind = UnitKind::Npc {
+            template_id,
+            owner_id: 0,
+        };
+        unit.pos = aa_net::Pos::new(x, 0.0, 0.0);
+        unit
+    }
+
+    #[test]
+    fn the_npc_interaction_reach_is_the_3d_surface_gap() {
+        let d = HudData {
+            player_radius: 0.5,
+            ..HudData::default()
+        };
+        let unit = npc(20, 42, 3.4);
+        let mut units = Units::default();
+        units.by_id.insert(20, unit.clone());
+
+        // base gap = centre distance - the player radius (the test unit has no model radius).
+        assert!(
+            npc_in_reach(&d, Vec3::ZERO, Vec3::new(3.4, 0.0, 0.0), &unit),
+            "2.9 m surface gap is inside the 3.0 m reach"
+        );
+        assert!(
+            !npc_in_reach(&d, Vec3::ZERO, Vec3::new(3.5, 0.0, 0.0), &unit),
+            "FUN_39093860 is strict: exactly 3.0 m is already out"
+        );
+        assert_eq!(
+            plan_npc_click(&d, &units, 0, Vec3::ZERO, 20, Vec3::new(3.4, 0.0, 0.0)),
+            Some(NpcClick::Talk((20, 42)))
+        );
+        assert_eq!(
+            plan_npc_click(&d, &units, 0, Vec3::ZERO, 20, Vec3::new(10.0, 0.0, 0.0)),
+            Some(NpcClick::Walk((20, 42), 9.5)),
+            "beyond the reach the click walks and sends nothing"
+        );
+    }
+
+    #[test]
+    fn a_dead_target_uses_the_3_5_m_reach() {
+        let mut unit = npc(20, 42, 3.0);
+        assert_eq!(interact_reach(&unit), INTERACT_REACH);
+        unit.dead = true;
+        assert_eq!(interact_reach(&unit), DEAD_INTERACT_REACH);
+    }
+
+    fn npc_walk_app(npc_at: f32) -> (App, Shared) {
+        let spawn = crate::hud::fixture_spawn();
+        let data = HudData {
+            character_id: spawn.character().id,
+            snapshot: crate::hud::data::Snapshot {
+                unit_id: spawn.obj_id.to_string(),
+                ..crate::hud::data::Snapshot::default()
+            },
+            pos: Vec3::ZERO,
+            ..HudData::default()
+        };
+        let shared: Shared = Rc::new(RefCell::new(data));
+        let mut units = Units::default();
+        units.by_id.insert(20, npc(20, 42, npc_at));
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(crate::settings::Actions::default())
+            .insert_resource(HudKeyboardFocus(false))
+            .insert_resource(Target::default())
+            .insert_resource(crate::ingame::DevOptions::default())
+            .insert_resource(super::super::HudSuspended::default())
+            .insert_resource(crate::hud::HudBuilt {
+                up: true,
+                fresh: false,
+            })
+            .insert_resource(Units::default())
+            .insert_resource(Player {
+                spawn: Some(spawn.clone()),
+            })
+            .insert_resource(Doodads::default())
+            .insert_resource(HudPointerOverUi::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ScriptedTalk::default())
+            .init_resource::<crate::script::ScriptPick>()
+            .init_resource::<Quests>()
+            .init_resource::<PlayerStats>()
+            .init_resource::<Inventory>()
+            .init_resource::<Skills>()
+            .init_resource::<Buffs>()
+            .insert_resource(units)
+            .insert_non_send(HudBridge(shared.clone()))
+            .add_message::<NetEvent>()
+            .add_message::<NetCommand>()
+            .add_systems(
+                Update,
+                (npc::track_npc, talk_input, walk_to_npc, talk_pointer, drive_npc).chain(),
+            );
+        app.world_mut().spawn((
+            crate::ingame::player::Mover {
+                pos: Vec3::ZERO,
+                facing: 0.0,
+                vz: 0.0,
+                grounded: true,
+                velocity: Vec3::ZERO,
+                swim: None,
+                wading: 0.0,
+            },
+            crate::ingame::player::LocalPlayer { obj_id: spawn.obj_id },
+        ));
+        app.world_mut()
+            .spawn(crate::ingame::camera::OrbitCamera::default());
+        (app, shared)
+    }
+
+    fn with_ui(app: &mut App) -> bool {
+        if !aa_world::pak_available() {
+            return false;
+        }
+        let Ok(rt) = aa_ui::UiRuntime::new("en_us", 1280.0, 720.0) else { return false };
+        app.insert_non_send(rt);
+        true
+    }
+
+    fn w_held(app: &App) -> bool {
+        app.world()
+            .resource::<crate::ingame::DevOptions>()
+            .script_keys
+            .contains('W')
+    }
+
+    #[test]
+    fn an_out_of_reach_npc_click_walks_and_sends_the_interaction_only_on_arrival() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        let spawn = app.world().resource::<Player>().spawn.clone().unwrap();
+        app.world_mut()
+            .write_message(NetEvent(Event::PlayerSpawn(Box::new(spawn))));
+        app.world_mut().write_message(NetEvent(Event::EnteredWorld));
+        let npc = app.world().resource::<Units>().get(20).unwrap().clone();
+        app.world_mut()
+            .write_message(NetEvent(Event::UnitSpawned(Box::new(npc))));
+        app.update();
+        app.world_mut()
+            .resource_mut::<crate::script::ScriptPick>()
+            .right_for_test(20);
+        app.update();
+        assert!(shared.borrow().dialog.approach.is_some());
+        assert!(w_held(&app), "the walk holds the forward key");
+        assert!(shared.borrow().dialog.npc_flow.intent_count() == 0);
+        assert!(
+            app.world_mut()
+                .resource_mut::<Messages<NetCommand>>()
+                .drain()
+                .next()
+                .is_none(),
+            "no CSStartInteraction before the walk arrives"
+        );
+
+        // The player walks (the movement path is another system; the position is what the reach reads).
+        shared.borrow_mut().pos = Vec3::new(8.5, 0.0, 0.0);
+        app.update();
+        app.update();
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app), "the arrived walk releases the key");
+        let commands: Vec<Command> = app
+            .world_mut()
+            .resource_mut::<Messages<NetCommand>>()
+            .drain()
+            .map(|c| c.0)
+            .collect();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, Command::Interact(Interact::Start { npc_obj_id: 20, .. }))),
+            "the talk starts with CSStartInteraction once inside the reach: {commands:?}"
+        );
+    }
+
+
+    fn npc_events(app: &mut App) {
+        let spawn = app.world().resource::<Player>().spawn.clone().unwrap();
+        app.world_mut()
+            .write_message(NetEvent(Event::PlayerSpawn(Box::new(spawn))));
+        app.world_mut().write_message(NetEvent(Event::EnteredWorld));
+        let npc = app.world().resource::<Units>().get(20).unwrap().clone();
+        app.world_mut()
+            .write_message(NetEvent(Event::UnitSpawned(Box::new(npc))));
+        app.update();
+    }
+
+    fn right_click(app: &mut App, obj_id: u32) {
+        app.world_mut()
+            .resource_mut::<crate::script::ScriptPick>()
+            .right_for_test(obj_id);
+        app.update();
+    }
+
+    fn commands(app: &mut App) -> Vec<Command> {
+        app.world_mut()
+            .resource_mut::<Messages<NetCommand>>()
+            .drain()
+            .map(|c| c.0)
+            .collect()
+    }
+
+    #[test]
+    fn an_in_reach_right_click_sends_exactly_one_cs_start_interaction() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        // A far click starts the walk; the next in-reach right click cancels it and talks.
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_some());
+        shared.borrow_mut().pos = Vec3::new(8.5, 0.0, 0.0);
+        right_click(&mut app, 20);
+        assert!(
+            shared.borrow().dialog.approach.is_none(),
+            "the in-reach click cancels the walk"
+        );
+        assert!(!w_held(&app));
+        let started = commands(&mut app)
+            .into_iter()
+            .filter(|c| matches!(c, Command::Interact(Interact::Start { npc_obj_id: 20, .. })))
+            .count();
+        assert_eq!(started, 1, "exactly one CSStartInteraction");
+    }
+
+    #[test]
+    fn an_in_reach_click_on_another_npc_cancels_the_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        let mut far = npc(21, 42, 30.0);
+        far.name = "Far NPC".into();
+        app.world_mut().resource_mut::<Units>().by_id.insert(21, far);
+        right_click(&mut app, 21);
+        assert_eq!(
+            shared.borrow().dialog.approach.map(|a| a.npc.0),
+            Some(21),
+            "the far NPC starts the walk"
+        );
+        shared.borrow_mut().pos = Vec3::new(8.5, 0.0, 0.0);
+        right_click(&mut app, 20);
+        assert!(
+            shared.borrow().dialog.approach.is_none(),
+            "the in-reach talk to the other NPC ends the walk"
+        );
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn a_new_target_cancels_the_npc_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_some());
+        app.world_mut().resource_mut::<Target>().obj_id = Some(99);
+        app.update();
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn f_cancels_the_npc_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_some());
+        app.world_mut()
+            .resource_mut::<crate::settings::Actions>()
+            .tap_for_test("do_interaction_1");
+        app.update();
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn a_click_on_another_unit_cancels_the_npc_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_some());
+        let mut other = crate::hud::fixture_spawn().unit;
+        other.obj_id = 30;
+        other.kind = UnitKind::Character { char_id: 30 };
+        app.world_mut()
+            .resource_mut::<Units>()
+            .by_id
+            .insert(30, other);
+        right_click(&mut app, 30);
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn a_driving_player_does_not_hold_w_for_the_npc_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        shared.borrow_mut().mounted.local_cart = Some(crate::hud::mounted::LocalCart {
+            obj_id: 31,
+            speed: 0.0,
+            turn_rate: 0.0,
+        });
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn a_player_seated_on_a_doodad_does_not_hold_w_for_the_npc_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        shared.borrow_mut().doodad.seated = true;
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn riding_a_mate_still_walks_to_a_far_npc() {
+        // `player_attachment` also reports a mate; only a slave seat or a cart is "seated" and blocks
+        // the walk (the forward key would drive it).
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        let spawn = app.world().resource::<Player>().spawn.clone().unwrap();
+        crate::hud::mounted::receive(&shared, &Event::PlayerSpawn(Box::new(spawn.clone())));
+        let mut mate = crate::hud::fixture_spawn().unit;
+        mate.obj_id = 31;
+        mate.name = "Snowlion".into();
+        mate.kind = UnitKind::Mate {
+            tl_id: 1,
+            template_id: 1,
+            owner_id: spawn.character().id,
+        };
+        crate::hud::mounted::receive(&shared, &Event::UnitSpawned(Box::new(mate)));
+        crate::hud::mounted::receive(
+            &shared,
+            &Event::UnitAttached {
+                obj_id: spawn.obj_id,
+                mount: 31,
+                point: 2,
+                reason: 0,
+            },
+        );
+        assert!(shared.borrow().mounted.riding_mate());
+        npc_events(&mut app);
+        right_click(&mut app, 20);
+        assert!(
+            shared.borrow().dialog.approach.is_some(),
+            "a mounted player still walks to a far NPC"
+        );
+        assert!(w_held(&app));
+    }
+
+    #[test]
+    fn f_under_a_doodad_claim_cancels_the_npc_walk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        if !with_ui(&mut app) { return; }
+        npc_events(&mut app);
+        right_click(&mut app, 20);
+        assert!(shared.borrow().dialog.approach.is_some());
+        shared.borrow_mut().doodad.claim_key_for_test();
+        app.world_mut()
+            .resource_mut::<crate::settings::Actions>()
+            .tap_for_test("do_interaction_1");
+        app.update();
+        assert!(
+            shared.borrow().dialog.approach.is_none(),
+            "F used by the doodad also ends the NPC walk"
+        );
+        assert!(!w_held(&app));
+    }
+
+    #[test]
+    fn a_scripted_talk_searches_past_the_interact_reach() {
+        let (app, shared) = npc_walk_app(10.0);
+        let d = shared.borrow();
+        let units = app.world().resource::<Units>();
+        let facts = PlayerFacts::default();
+        let find = |wanted| {
+            nearest_npc(
+                &d,
+                Vec3::ZERO,
+                units,
+                100,
+                0,
+                &facts,
+                60.0,
+                wanted,
+                &|u: &Unit| Some(Vec3::new(u.pos.x, u.pos.y, u.pos.z)),
+            )
+        };
+        assert_eq!(find(true), Some((20, 42)), "the scripted talk finds an NPC at 10 m");
+        assert_eq!(find(false), None, "the interact key stays inside the interaction reach");
+    }
+
+    fn quest_notice_app() -> Option<(App, Shared)> {
+        if !aa_world::pak_available() { return None; }
+        let path = std::env::var("AA_DB").unwrap_or_else(|_| aa_anim::db::DEFAULT_DB.to_string());
+        let game = GameData::load(&path).ok()?;
+        let rt = aa_ui::UiRuntime::new("en_us", 1280.0, 720.0).ok()?;
+        rt.lua
+            .load(
+                r#"
+                OBSERVED={}
+                X2Locale.LocalizeUiText=function(self,group,key,arg) return key..':'..tostring(arg) end
+                local w=UIParent:CreateWidget('emptywidget','questNotice','UIParent')
+                w:SetHandler('OnEvent',function(self,event,...) table.insert(OBSERVED,{event=event,args={...}}) end)
+                w:RegisterEvent('QUEST_ERROR_INFO');w:RegisterEvent('QUEST_QUICK_CLOSE_EVENT');w:RegisterEvent('QUEST_LEFT_TIME_UPDATED');w:RegisterEvent('DOODAD_PHASE_MSG')
+            "#,
+            )
+            .exec()
+            .ok()?;
+        let data = HudData {
+            dialog: DialogView { directing: true, quest: Some(1065), npc: Some((1, 1)), ..Default::default() },
+            ..HudData::default()
+        };
+        let _ = data.game.0.set(game);
+        let shared: Shared = Rc::new(RefCell::new(data));
+        let hud = rt.lua.create_table().unwrap();
+        super::install(&rt.lua, &hud, &shared).unwrap();
+        rt.lua.globals().set("HUD", hud).unwrap();
+        let mut app = App::new();
+        app.add_message::<NetEvent>()
+            .add_message::<super::super::alerts::UseFailed>()
+            .insert_resource(Target::default())
+            .insert_non_send(HudBridge(shared.clone()))
+            .add_systems(Update, route_quest_notices);
+        app.insert_non_send(rt);
+        Some((app, shared))
+    }
+
+    #[test]
+    fn a_refused_quest_ends_directing_only_for_that_quest_and_raises_error_info() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        shared.borrow_mut().dialog.left_times.insert(1065, QuestClock { end_ms: 5_000, started: Instant::now() });
+        // The failed quest is not the one the window is directing: it stays up.
+        app.world_mut()
+            .write_message(NetEvent(Event::QuestContextFailed(aa_net::quest::QuestContextFailed { quest_id: 1066, err: 6 })));
+        app.update();
+        assert!(shared.borrow().dialog.directing);
+        // The directed quest itself: the window ends and QUEST_ERROR_INFO carries (err, qtype).
+        app.world_mut()
+            .write_message(NetEvent(Event::QuestContextFailed(aa_net::quest::QuestContextFailed { quest_id: 1065, err: 6 })));
+        app.update();
+        assert!(!shared.borrow().dialog.directing);
+        assert_eq!(shared.borrow().dialog.quest, None, "ending directing clears the window quest");
+        assert!(shared.borrow().dialog.left_times.is_empty(), "the failure clears the quest clock");
+        let rt = app.world().non_send::<UiRuntime>();
+        rt.lua
+            .load(
+                r#"
+                assert(#OBSERVED==3 and OBSERVED[1].event=='QUEST_ERROR_INFO' and OBSERVED[1].args[1]==6 and OBSERVED[1].args[2]==1066)
+                assert(OBSERVED[2].event=='QUEST_LEFT_TIME_UPDATED')
+                assert(OBSERVED[2].args[1]==1065 and OBSERVED[2].args[2]==0)
+                assert(OBSERVED[3].event=='QUEST_ERROR_INFO')
+                assert(OBSERVED[3].args[1]==6 and OBSERVED[3].args[2]==1065)
+            "#,
+            )
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_late_refusal_for_an_old_quest_does_not_end_a_newer_window() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        // playLines tells the app which quest the window shows (HUD.quest_show); the previous
+        // request's quest must not be used for the refusal comparison.
+        app.world().non_send::<UiRuntime>().lua.load("HUD.quest_show(1066)").exec().unwrap();
+        assert_eq!(shared.borrow().dialog.quest, Some(1066));
+        app.world_mut()
+            .write_message(NetEvent(Event::QuestContextFailed(aa_net::quest::QuestContextFailed { quest_id: 1065, err: 6 })));
+        app.update();
+        assert!(shared.borrow().dialog.directing, "a late refusal for 1065 must not end the window showing 1066");
+        app.world_mut()
+            .write_message(NetEvent(Event::QuestContextFailed(aa_net::quest::QuestContextFailed { quest_id: 1066, err: 6 })));
+        app.update();
+        assert!(!shared.borrow().dialog.directing, "the window's own quest still closes it");
+    }
+
+    #[test]
+    fn a_failed_quest_unit_quick_closes_the_directing_window_only_for_the_current_target() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        app.world_mut().resource_mut::<Target>().obj_id = Some(42);
+        let failed = |unit_obj_id, result| {
+            NetEvent(Event::QuestUnitReqFailed(aa_net::quest::QuestUnitReqFailed {
+                quest_id: 1065,
+                unit_obj_id,
+                result,
+            }))
+        };
+        let refused = aa_net::skill::SkillResult { raw_flags: 5, code: 9, extra: 0, value: 7 };
+        app.world_mut().write_message(failed(43, refused));
+        app.update();
+        assert!(shared.borrow().dialog.directing, "another unit failing does not close the window");
+        assert!(
+            app.world_mut().resource_mut::<Messages<super::super::alerts::UseFailed>>().drain().next().is_none(),
+            "another unit failing reports nothing"
+        );
+        app.world_mut().write_message(failed(42, refused));
+        app.update();
+        assert!(!shared.borrow().dialog.directing);
+        let reported: Vec<_> = app.world_mut().resource_mut::<Messages<super::super::alerts::UseFailed>>().drain().collect();
+        assert_eq!(reported.len(), 1, "FUN_39376590 reports the result before 0xf4");
+        assert_eq!((reported[0].skill, reported[0].result, reported[0].value, reported[0].server), (0, 9, 7, true));
+        // FUN_39390900's cooldown-detail silence is inside its skill-lookup branch, and
+        // FUN_39376590 passes the no-skill sentinel DAT_3a173784, so result 8 / detail 2 reports.
+        app.world_mut().write_message(failed(42, aa_net::skill::SkillResult { raw_flags: 5, code: 8, extra: 0, value: 2 }));
+        app.update();
+        let reported: Vec<_> = app.world_mut().resource_mut::<Messages<super::super::alerts::UseFailed>>().drain().collect();
+        assert_eq!(reported.len(), 1, "the no-skill sentinel skips the cooldown silence");
+        assert_eq!((reported[0].result, reported[0].value), (8, 2));
+        let rt = app.world().non_send::<UiRuntime>();
+        rt.lua
+            .load("assert(#OBSERVED==2 and OBSERVED[1].event=='QUEST_QUICK_CLOSE_EVENT' and OBSERVED[2].args[1]==1065)")
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn quest_mail_sent_shows_the_quest_mail_name_as_the_argument() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        let name = shared.borrow().game.get().and_then(|game| game.quests.quest_mail_names.get(&1)).cloned();
+        let Some(name) = name else { return };
+        app.world_mut().write_message(NetEvent(Event::QuestMailSent(aa_net::quest::QuestMailSent { id: 1 })));
+        app.update();
+        let expected = format!("QUEST_MAIL_SENT:{name}");
+        let rt = app.world().non_send::<UiRuntime>();
+        rt.lua.globals().set("EXPECTED", expected).unwrap();
+        rt.lua
+            .load("assert(#OBSERVED==1 and OBSERVED[1].event=='DOODAD_PHASE_MSG' and OBSERVED[1].args[1]==EXPECTED)")
+            .exec()
+            .unwrap();
+        // FUN_3937a650 shows nothing when the quest_mails lookup fails.
+        app.world_mut().write_message(NetEvent(Event::QuestMailSent(aa_net::quest::QuestMailSent { id: 999_999 })));
+        app.update();
+        app.world().non_send::<UiRuntime>().lua.load("assert(#OBSERVED==1)").exec().unwrap();
+    }
+
+    #[test]
+    fn reward_mail_shows_the_quest_title_and_a_failed_send_raises_error_11() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        let title = shared.borrow().game.get().and_then(|game| game.quests.def(330)).map(|def| def.name.clone());
+        let Some(title) = title else { return };
+        app.world_mut().write_message(NetEvent(Event::Interaction(InteractEvent::RewardedByMail { success: true, quest: 330 })));
+        app.update();
+        let expected = format!("QUEST_REWARDED_BY_MAIL:{title}");
+        let rt = app.world().non_send::<UiRuntime>();
+        rt.lua.globals().set("EXPECTED", expected).unwrap();
+        rt.lua
+            .load("assert(#OBSERVED==1 and OBSERVED[1].event=='DOODAD_PHASE_MSG' and OBSERVED[1].args[1]==EXPECTED)")
+            .exec()
+            .unwrap();
+        // FUN_3937a520(0, qtype) -> FUN_3937a130(qtype, 0xb), raised as (err, qtype).
+        app.world_mut().write_message(NetEvent(Event::Interaction(InteractEvent::RewardedByMail { success: false, quest: 330 })));
+        app.update();
+        let rt = app.world().non_send::<UiRuntime>();
+        rt.lua
+            .load("assert(#OBSERVED==2 and OBSERVED[2].event=='QUEST_ERROR_INFO' and OBSERVED[2].args[1]==11 and OBSERVED[2].args[2]==330)")
+            .exec()
+            .unwrap();
+        // A quest missing from the table shows nothing, even for a successful send.
+        app.world_mut().write_message(NetEvent(Event::Interaction(InteractEvent::RewardedByMail { success: true, quest: 999_999 })));
+        app.update();
+        app.world().non_send::<UiRuntime>().lua.load("assert(#OBSERVED==2)").exec().unwrap();
+    }
+
+    fn timed(left_ms: i32) -> Quest {
+        Quest { template_id: 330, status: status::PROGRESS, time_left_ms: left_ms, accept_time: 0, ..Quest::default() }
+    }
+
+    #[test]
+    fn the_quest_clock_counts_down_from_its_local_receipt_time() {
+        let start = Instant::now();
+        let clock = QuestClock { end_ms: 60_000, started: start };
+        assert_eq!(clock_left_ms(&clock, start), 60_000);
+        assert_eq!(clock_left_ms(&clock, start + Duration::from_secs(30)), 30_000);
+        assert_eq!(clock_left_ms(&clock, start + Duration::from_millis(59_500)), 500);
+        assert_eq!(clock_left_ms(&clock, start + Duration::from_secs(61)), -1_000);
+        // a clock seen before its start never gains time
+        let future = QuestClock { end_ms: 5_000, started: start + Duration::from_secs(1) };
+        assert_eq!(clock_left_ms(&future, start), 5_000);
+    }
+
+    #[test]
+    fn the_quest_clock_publishes_seconds_and_clears_the_clock_at_one() {
+        let start = Instant::now();
+        let q = timed(60_000);
+        let mut left = BTreeMap::from([
+            (331, QuestClock { end_ms: 5_000, started: start }),
+            (330, QuestClock { end_ms: 60_000, started: start }),
+        ]);
+        // the stale timed quest is cleared, then the live one is published
+        assert_eq!(tick_left_times(&mut left, std::slice::from_ref(&q), start), vec![(331, 0), (330, 60_000)]);
+        assert!(!left.contains_key(&331));
+        // the last published second, then FUN_39379ea0's timeout path publishes 0 once
+        assert_eq!(tick_left_times(&mut left, std::slice::from_ref(&q), start + Duration::from_secs(59)), vec![(330, 1_000)]);
+        assert_eq!(tick_left_times(&mut left, std::slice::from_ref(&q), start + Duration::from_secs(60)), vec![(330, 0)]);
+        assert_eq!(tick_left_times(&mut left, std::slice::from_ref(&q), start + Duration::from_secs(61)), Vec::new());
+        assert!(left.is_empty());
+        // leaving the list before its last second also hides the clock
+        let mut left = BTreeMap::from([(330, QuestClock { end_ms: 5_000, started: start })]);
+        assert_eq!(tick_left_times(&mut left, &[], start), vec![(330, 0)]);
+        assert!(left.is_empty());
+    }
+
+    #[test]
+    fn the_quest_clock_system_uses_the_local_receipt_time_and_the_script_getter() {
+        if !aa_world::pak_available() { return; }
+        let path = std::env::var("AA_DB").unwrap_or_else(|_| aa_anim::db::DEFAULT_DB.to_string());
+        let Ok(game) = GameData::load(&path) else { return };
+        let Ok(rt) = aa_ui::UiRuntime::new("en_us", 1280.0, 720.0) else { return };
+        rt.lua
+            .load(
+                r#"
+                LEFT={}
+                local w=UIParent:CreateWidget('emptywidget','questClock','UIParent')
+                w:SetHandler('OnEvent',function(self,event,...) table.insert(LEFT,{...}) end)
+                w:RegisterEvent('QUEST_LEFT_TIME_UPDATED')
+            "#,
+            )
+            .exec()
+            .unwrap();
+        let data = HudData { game: super::super::SharedGameData::default(), ..HudData::default() };
+        let _ = data.game.0.set(game);
+        let shared: Shared = Rc::new(RefCell::new(data));
+        let hud = rt.lua.create_table().unwrap();
+        super::install(&rt.lua, &hud, &shared).unwrap();
+        rt.lua.globals().set("HUD", hud.clone()).unwrap();
+        rt.lua.load("X2Quest = X2Quest or {}; X2Decal = X2Decal or {}; X2Interaction = X2Interaction or {}; X2Util = X2Util or {}; X2 = X2 or {}").exec().unwrap();
+        super::load_script(&rt.lua).unwrap();
+        // an accept stamp half a minute old and a full 60 s left: only the receipt time counts
+        let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let mut quest = timed(60_000);
+        quest.accept_time = now - 30;
+        let mut quests = Quests::default();
+        quests.active.push(quest);
+        let mut app = App::new();
+        app.insert_resource(quests)
+            .insert_non_send(HudBridge(shared.clone()))
+            .add_systems(Update, tick_quest_left_time);
+        app.insert_non_send(rt);
+        app.update();
+        let rt = app.world().non_send::<UiRuntime>();
+        rt.lua
+            .load("assert(#LEFT==1 and LEFT[1][1]==330 and LEFT[1][2]>59000 and LEFT[1][2]<=60000)")
+            .exec()
+            .unwrap();
+        let left: i32 = rt.lua.load("return X2Quest:GetQuestContextLeftTime(330)").eval().unwrap();
+        assert!(left > 59_000 && left <= 60_000, "the getter reads the live clock, not accept_time: {left}");
+        let none: i32 = rt.lua.load("return X2Quest:GetQuestContextLeftTime(331)").eval().unwrap();
+        assert_eq!(none, -1, "no entry reads -1 (FUN_39379e30)");
+        // playLines tells the app which quest the window shows (HUD.quest_show).
+        rt.lua.load("FAKE={fire_later=function() end}").exec().unwrap();
+        rt.lua
+            .load("X2Quest:EnterQuestDirectingMode(); X2Quest:TryStartQuestContext(nil, 330, 0)")
+            .exec()
+            .unwrap();
+        assert_eq!(shared.borrow().dialog.quest, Some(330), "the window's own quest reaches the app");
+        rt.lua.load("X2Quest:LeaveQuestDirectingMode()").exec().unwrap();
+        assert_eq!(shared.borrow().dialog.quest, None, "LeaveQuestDirectingMode clears it");
+    }
+
+    #[test]
+    fn started_and_updated_start_the_clock_at_local_receipt() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        let before = Instant::now();
+        let q = Quest { id: 77, accept_time: 1_000, ..timed(60_000) };
+        app.world_mut().write_message(NetEvent(Event::QuestStarted(q.clone())));
+        app.update();
+        let clock = shared.borrow().dialog.left_times.get(&330).copied().expect("Started starts the clock");
+        assert_eq!(clock.end_ms, 60_000);
+        assert!(clock.started.saturating_duration_since(before) < Duration::from_secs(2));
+        // FUN_3937b240 replaces both values on every Started / Updated
+        let later = before + Duration::from_secs(10);
+        start_quest_clock(&shared, &q, 30_000, later);
+        let clock = shared.borrow().dialog.left_times.get(&330).copied().unwrap();
+        assert_eq!(clock.end_ms, 30_000);
+        assert_eq!(clock.started, later);
+    }
+
+    #[test]
+    fn an_updated_status_change_hides_the_clock_on_the_next_tick() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        let q = Quest { id: 77, ..timed(60_000) };
+        app.world_mut().write_message(NetEvent(Event::QuestStarted(q.clone())));
+        app.update();
+        assert!(shared.borrow().dialog.left_times.contains_key(&330));
+        let ready = Quest { status: status::READY, ..q };
+        app.world_mut().write_message(NetEvent(Event::QuestUpdated(ready.clone())));
+        app.update();
+        assert_eq!(shared.borrow().dialog.left_times.get(&330).unwrap().end_ms, -1, "FUN_3937b240(qtype, -1)");
+        let events = tick_quest_clocks(&mut shared.borrow_mut().dialog, &[ready], Instant::now());
+        assert_eq!(events, vec![(330, 0)], "the next tick removes it and publishes 0");
+        assert!(!shared.borrow().dialog.left_times.contains_key(&330));
+    }
+
+    #[test]
+    fn an_expired_clock_is_not_restarted_by_the_tick() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        let q = Quest { id: 77, ..timed(60_000) };
+        let start = Instant::now();
+        assert_eq!(
+            tick_quest_clocks(&mut shared.borrow_mut().dialog, std::slice::from_ref(&q), start),
+            vec![(330, 60_000)],
+            "the login list seeds the clock once"
+        );
+        assert_eq!(
+            tick_quest_clocks(&mut shared.borrow_mut().dialog, std::slice::from_ref(&q), start + Duration::from_secs(61)),
+            vec![(330, 0)]
+        );
+        assert!(shared.borrow().dialog.left_times.is_empty());
+        // FUN_3937b240 is the only creator: the tick must not restart the expired clock.
+        assert!(tick_quest_clocks(&mut shared.borrow_mut().dialog, std::slice::from_ref(&q), start + Duration::from_secs(62)).is_empty());
+        assert!(shared.borrow().dialog.left_times.is_empty(), "an expired clock stays gone");
+        // the server's next Updated starts it again.
+        app.world_mut().write_message(NetEvent(Event::QuestUpdated(q.clone())));
+        app.update();
+        assert!(shared.borrow().dialog.left_times.contains_key(&330), "a later Updated restarts the clock");
+        let events = tick_quest_clocks(&mut shared.borrow_mut().dialog, std::slice::from_ref(&q), Instant::now());
+        assert!(events.len() == 1 && events[0].0 == 330 && events[0].1 > 0, "{events:?}");
+    }
+
+    #[test]
+    fn a_later_started_or_updated_releases_the_refusal_latch() {
+        let Some((mut app, shared)) = quest_notice_app() else { return };
+        let q = Quest { id: 77, ..timed(60_000) };
+        shared.borrow_mut().dialog.quests.push(q.clone());
+        app.world_mut()
+            .write_message(NetEvent(Event::QuestContextFailed(aa_net::quest::QuestContextFailed { quest_id: 330, err: 5 })));
+        app.update();
+        assert!(shared.borrow().dialog.left_times.is_empty());
+        // the tick does not restore the refused instance
+        let events = tick_quest_clocks(&mut shared.borrow_mut().dialog, std::slice::from_ref(&q), Instant::now());
+        assert!(events.is_empty());
+        assert!(shared.borrow().dialog.left_times.is_empty(), "the refusal latch holds");
+        // a later Updated of the same instance releases it and restarts the clock
+        let updated = Quest { time_left_ms: 5_000, ..q };
+        app.world_mut().write_message(NetEvent(Event::QuestUpdated(updated.clone())));
+        app.update();
+        assert_eq!(shared.borrow().dialog.left_times.get(&330).unwrap().end_ms, 5_000);
+        let events = tick_quest_clocks(&mut shared.borrow_mut().dialog, &[updated], Instant::now());
+        assert!(events.len() == 1 && events[0].0 == 330 && events[0].1 > 0, "the released clock is published: {events:?}");
+    }
+
+    #[test]
+    fn a_lost_npc_cancels_the_walk_without_a_talk() {
+        let (mut app, shared) = npc_walk_app(10.0);
+        start_walk(&mut shared.borrow_mut(), (20, 42), 9.5, 0.0, None);
+        app.update();
+        app.world_mut().resource_mut::<Units>().by_id.clear();
+        shared.borrow_mut().pos = Vec3::new(8.5, 0.0, 0.0);
+        app.update();
+        assert!(shared.borrow().dialog.approach.is_none());
+        assert!(!w_held(&app));
+        assert!(shared.borrow().dialog.npc_flow.intent_count() == 0);
+        assert!(
+            app.world_mut()
+                .resource_mut::<Messages<NetCommand>>()
+                .drain()
+                .next()
+                .is_none()
+        );
     }
 }

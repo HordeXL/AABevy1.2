@@ -129,7 +129,7 @@ struct Counter {
 }
 
 impl SoundBook {
-    fn open() -> SoundBook {
+    pub(crate) fn open() -> SoundBook {
         let path = std::env::var("AA_DB").unwrap_or_else(|_| aa_anim::db::DEFAULT_DB.to_string());
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI).ok();
         let footsteps: Arc<OnceLock<Footsteps>> = Arc::default();
@@ -207,7 +207,8 @@ impl SoundBook {
         weapon.sound(conn.as_ref()?, blows, impact, mainhand, target.into())
     }
 
-    /// The sound events of the clips of a model's `$SoundEventDatabase`; `None` while it is being read.
+    /// The sound events of the clips of a model's `$SoundEventDatabase`, their times phases of the clip; `None` while it is being
+    /// read. [`SoundBook::clip_events`] gives seconds.
     pub fn clip_sounds(&self, database: &str, clip_name: &str) -> Option<Arc<[AnimSound]>> {
         let slot = {
             let mut inner = self.inner();
@@ -230,15 +231,17 @@ impl SoundBook {
         Some(table.get(&file_name(clip_name)).cloned().unwrap_or_else(|| Arc::from(Vec::new())))
     }
 
-    /// The sound events of a clip as the unit plays it: its own, else (a direction of a locomotion group, `fist_mo_normal_run_fl`) the
-    /// ones of the group's `.lmg`, whose times are phases of the cycle (`duration` is the length of the clip).
+    /// The sound events of a clip as the unit plays it, in seconds into a clip `duration` long: its own, else (a direction of a
+    /// locomotion group, `fist_mo_normal_run_fl`) the ones of the group's `.lmg`. Both hold phases of the clip (0..=1, see
+    /// `combat::clips`), which the original client plays at `time * duration`.
     pub fn clip_events(&self, database: &str, file: &str, duration: f32) -> Option<Arc<[AnimSound]>> {
         let own = self.clip_sounds(database, file)?;
-        if !own.is_empty() {
-            return Some(own);
-        }
-        let Some(group) = locomotion_group(file) else { return Some(own) };
-        let phases = self.clip_sounds(database, &group)?;
+        let phases = if own.is_empty() {
+            let Some(group) = locomotion_group(file) else { return Some(own) };
+            self.clip_sounds(database, &group)?
+        } else {
+            own
+        };
         Some(phases.iter().map(|e| AnimSound { time: e.time * duration, ..e.clone() }).collect())
     }
 
@@ -715,7 +718,10 @@ fn scan_particle_sounds(xml: &str) -> HashMap<String, Arc<[Arc<str>]>> {
                     depth += 1;
                 }
             }
-            "Params" => {
+            // a disabled emitter (`Enabled="false"`) makes no sound, its children still play (as they still emit, `aa_fx::library`):
+            // `fight.dash_dot`'s `hold_steps_dot_sound` is off and the 1.2 client plays only `dash_dot` (skill parity trace t1f,
+            // Charge, 2026-11-03); 204 of the 341 sound emitters of `abillity_skill_table_m` are off
+            "Params" if !attribute(tag, "Enabled").is_some_and(|v| v.trim().eq_ignore_ascii_case("false") || v.trim() == "0") => {
                 if let (Some((_, sounds)), Some(sound)) = (current.as_mut(), attribute(tag, "Sound")) {
                     let sound = sound.trim();
                     if !sound.is_empty() && !sounds.iter().any(|s| s.eq_ignore_ascii_case(sound)) {
@@ -1178,6 +1184,7 @@ mod tests {
  <Particles Name="p_effect.b"><Params Count="1"/></Particles>
  <Particles Name="p_effect.c"><Params Sound="Sounds/x2skills:wild:one"/></Particles>
  <Particles Name="P_Effect.D"><Params Sound="sounds/x2skills:wild:three"/><Childs><Particles Name="x"><Params Sound="Sounds/X2Skills:Wild:Three"/></Particles></Childs></Particles>
+ <Particles Name="fight.dash_dot"><Params Count="3"/><Childs><Particles Name="hold_steps_dot_sound"><Params Enabled="false" Continuous="true" Sound="Sounds/x2skills:wild:hold_steps_dot"/><Childs><Particles Name="under"><Params Sound="sounds/x2skills:wild:under"/></Particles></Childs></Particles><Particles Name="on"><Params Enabled="true" Sound="sounds/x2skills:fight:on"/></Particles></Childs></Particles>
 </ParticleLibrary>"#;
         let t = scan_particle_sounds(xml);
         let names = |k: &str| t.get(k).map(|s| s.iter().map(|p| p.to_string()).collect::<Vec<_>>());
@@ -1186,6 +1193,8 @@ mod tests {
         assert_eq!(names("p_effect.c"), Some(vec!["Sounds/x2skills:wild:one".to_string()]));
         // the same event twice (any case) once
         assert_eq!(names("p_effect.d").map(|v| v.len()), Some(1));
+        // a disabled emitter has no sound; its child and the enabled sibling do
+        assert_eq!(names("fight.dash_dot"), Some(vec!["sounds/x2skills:wild:under".to_string(), "sounds/x2skills:fight:on".to_string()]));
     }
 
     #[test]
@@ -1213,6 +1222,14 @@ mod tests {
         // the particle library of the arrow has sounds somewhere
         let bytes = aa_cry::read("libs/particles/x2_sounds.xml").unwrap();
         assert!(!scan_particle_sounds(&String::from_utf8_lossy(&bytes)).is_empty());
+        // Charge's sound emitters are all switched off: the `fx_particles.sound_id` of the rows plays `dash_launch`, `dash_hit` and
+        // `dash_dot` (as the 1.2 client does), and `dash_dot`'s `hold_steps_dot_sound`, which has no row, plays nothing
+        let bytes = aa_cry::read("libs/particles/abillity_skill_table_m.xml").unwrap();
+        let skills = scan_particle_sounds(&String::from_utf8_lossy(&bytes));
+        for effect in ["fight.dash_launch", "fight.dash_hit", "fight.dash_dot"] {
+            assert_eq!(skills.get(effect), None, "{effect}");
+        }
+        assert!(!skills.is_empty(), "the enabled emitters keep their sounds");
         // the surface of the dirt material
         let mtl = aa_cry::read("materials/aa_terrain/field/tr_field_dirt_001c.mtl").unwrap();
         assert_eq!(material_surface(&String::from_utf8_lossy(&mtl)).as_deref(), Some("mat_dirt"));
