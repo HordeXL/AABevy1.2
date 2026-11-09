@@ -542,6 +542,11 @@ for other units is event only.
 | `SCUnitHealed` | `UnitHealed(UnitHeal { target_obj_id, heal_type, hit_type, value })` | event only |
 | `SCCombatText` | `CombatText { source, target, text_type }` | event only |
 
+A Charge-shaped acceptance batch is `SCCooldowns` plus the first `SCPlotEvent` with no `SCSkillStarted` / `SCSkillFired`:
+the packet appends the received 12 s own cooldown, the step stamps `last_cast` / `last_used` and the `casting` entry, and the
+step's `GlobalCooldown` effect (event 5099 -> 600 ms in the 1.2 data) stamps `plot_gcd`. The regression test is
+`a_charge_shaped_acceptance_batch_starts_the_gcd_skill_cooldown_and_cast` in `state/skills.rs`.
+
 **Combat events for visuals** (what `ingame/combat.rs` draws, see `docs/aa-client-combat.md`): for any unit a cast starts as
 `SkillStarted { tl, skill_id, caster, target, cast_ms }`, fires as `SkillFired { tl, skill_id, caster, target, delay_ms, fire_anim_id }`
 (`delay_ms` is how long the effects take to land: an arrow in flight), and every plot step is a `PlotEvent`. Damage is
@@ -660,6 +665,7 @@ The quest notices are their own `Event` variants (`aa_net::quest`), not interact
 | `QuestContextFailed { quest_id, err }` | `SCQuestContextFailed` 0x146: `u32` quest id, `u8` error | `FUN_397b5c90` (fields `"type"` u32, `"err"` u8) -> `OnQuestContextFailed` `FUN_391dbcd0` -> `FUN_3937a130`, which raises `QUEST_ERROR_INFO` |
 | `QuestUnitReqFailed { quest_id, unit_obj_id, result }` | `SCQuestUnitReqFailed` 0x148: `u32` id, `bc` unit, `SkillResult` | `FUN_397b5d00` (`"type"`, `"bc"`, `SkillResult` through `FUN_397b1ef0`) -> `OnQuestUnitReqFailed` `FUN_391dbdd0` -> `FUN_39376590`, which raises `QUEST_QUICK_CLOSE_EVENT` when it is the current target |
 | `QuestMailSent { id }` | `SCQuestMailSent` 0x150: one `u32` (`quest_mails.id`) | `FUN_397b5f00` (`"type"`) -> `OnQuestMailSent` `FUN_391dc1d0` -> `FUN_3937a650`, `DOODAD_PHASE_MSG(QUEST_MAIL_SENT with the row's name)` |
+| `QuestArea { ty, x, y, z, radius }` | `SCShowQuestArea` 0x1af: `u32` type, `i64` x, `i64` y, `f32` z, `f32` radius (fixed-point Cry-space X/Y) | `FUN_397b7940` (`"type"`, `"x"`, `"y"`, `"z"`, `"radius"`) -> `OnShowQuestArea` `FUN_391df7b0` -> `FUN_393840b0` (append to the area list; no Lua event) |
 
 `SCQuestContextFailed` matches the server's writer (`systems/quests/packets.rs`). The other two have no
 server writer (only the opcode constants); their tests use the client reader's bytes. The 1.2 reader for
@@ -684,7 +690,11 @@ What the lane server (`bevy`) does not do:
 * It sends no refusal: `SCQuestContextFailed` and `SCQuestUnitReqFailed` are never sent, so a refused
   accept or hand-in gets no answer. Bevy now decodes and shows them when a server does send them; with
   the lane server the dialog stays open until Escape.
-* `CSQuestStartWith` and `CSRestartMainQuest` are only logged.
+* `CSQuestStartWith` is only logged. `CSRestartMainQuest` 0x0fd (one `u32` quest id) is now read
+  by `try_restart_quest` (`systems/quests/engine.rs`) and answers with a normal
+  `SCQuestContextStartedPacket`; Bevy sends it from `X2Quest:QuestContextRestart` with the native
+  preconditions (main detail 2, active, not completed, 3 s throttle, free bag slots for the
+  re-supplied items).
 * No distance check on talk, accept or hand-in: any NPC in view can be talked to.
 * `CSInteractNPC` only gets an empty `SCAiAggro`: no greeting, no `SCNpcChatMessage`.
 
@@ -1796,6 +1806,20 @@ leaving 12 bytes to be mistaken for another opcode in DD04. It now consumes and 
 all fields in `ServerMsg::DoodadPhaseChanged` and `Event::DoodadPhaseChanged`
 (`obj_id, func_group_id, time_left, puzzle_group, item_template_id`). The lane currently
 writes puzzleGroup=-1; the decoder preserves the signed wire value instead of guessing.
+
+`Command::ChangeDoodadPhase { obj_id, skill_id, next_phase, func_id }` is the client's own
+`CSChangeDoodadPhasePacket` 0x0e9 (`FUN_397ac8d0(objId, skill, nextPhase, funcId)` in the
+1.2 client): `bc objId, u32 skill, u32 nextPhase, u32 funcId`. The session sends it only in
+world with a nonzero 24-bit object id. The Rust server (AAEmu-1.2-Rust) registers opcode
+0x0e9 in `systems/npcs/doodad/packets.rs:189`; on main its handler only logs the packet (as
+the C# server did), and a server PR implementing it is in progress. The byte layout above
+is the 1.2 client writer (`game.rs` test), checked against the C# reader.
+
+`ShopCommand::BuyCoin { obj_id, func_id }` is `CSBuyCoinItemPacket` 0x0af
+(`bc objId, u32 funcId`), the coin-item confirmation of a `DoodadFuncPurchase`. The Rust
+server implements `buy_coin_item` in `systems/npcs/bridges.rs:1214`: it resolves the doodad
+func's template (`DoodadManager.GetFunc` + `GetFuncTemplate`) and runs `use_func` (the old
+C# hook only logged a warning).
 
 `Doodads` updates those four fields only on an already-known object, preserving identity,
 position, owner and plant time. Zero item/time values clear previous values. Unknown or

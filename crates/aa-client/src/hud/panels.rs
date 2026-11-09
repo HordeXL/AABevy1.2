@@ -760,7 +760,9 @@ pub struct Changed {
 
 /// Use what is in global action bar slot `slot` (1 based): cast the skill, use the item. What the client already knows is
 /// refused (no target, too far, no mana ...) is not sent: the alert says why instead ([`UseFailed`]). A press that waits for
-/// the global cooldown, the cast it repeats or the answer to the last press is dropped without an alert ([`Env::held_back`]).
+/// the global cooldown, the cast it repeats or the answer to the last press is not sent ([`Env::held_back`]); it still shows the
+/// native refusal when there is one ([`Env::held_back_refusal`]: the life and buff rules, another cast, the skill's own
+/// cooldown), and a GCD-only or unanswered press stays silent.
 #[allow(clippy::too_many_arguments)]
 pub fn use_slot(slot: usize, env: &Env, flight: &InFlight, bar: &ActionBar, inventory: &Inventory, target: &Target, net: &mut MessageWriter<SkillPressed>, failed: &mut MessageWriter<UseFailed>) {
     let Some(action) = bar.get(slot) else { return };
@@ -768,6 +770,10 @@ pub fn use_slot(slot: usize, env: &Env, flight: &InFlight, bar: &ActionBar, inve
     match action.kind {
         ActionKind::Spell | ActionKind::RidePetSpell => {
             let skill = action.id as u32;
+            if let Some(f) = env.held_back_refusal(skill, flight) {
+                failed.write(UseFailed { skill, result: f.result, value: f.value, server: false });
+                return;
+            }
             if env.held_back(skill, flight) {
                 return;
             }
@@ -805,10 +811,28 @@ pub fn use_bag_slot(slot: usize, env: &Env, flight: &InFlight, inventory: &Inven
     }
 }
 
+/// Use a worn item (the tracker's item of an equipment slot, `X2Equipment.UseEquippedItemByType`).
+/// `FUN_3946e770` refuses before any send when the use skill does not resolve (`FUN_396f6390`); it
+/// takes `items.use_skill_id`, not the grade skill `FUN_397cf7a0` picks for impl 1 / 2 / 24.
+pub fn use_equipped_slot(slot: usize, env: &Env, flight: &InFlight, inventory: &Inventory, target: &Target, net: &mut MessageWriter<SkillPressed>, failed: &mut MessageWriter<UseFailed>) {
+    let Some(Some(item)) = inventory.equipment.slots.get(slot) else { return };
+    let Some(game) = env.game else { return };
+    if !game.items.get(&item.template_id).is_some_and(|i| i.use_skill != 0 && game.skills.contains_key(&i.use_skill)) {
+        return;
+    }
+    use_item(item, env, flight, target.obj_id.unwrap_or(0), net, failed);
+}
+
 fn use_item(item: &aa_net::model::Item, env: &Env, flight: &InFlight, target_obj_id: u32, net: &mut MessageWriter<SkillPressed>, failed: &mut MessageWriter<UseFailed>) {
     let skill_id = env.game.and_then(|g| g.items.get(&item.template_id)).map_or(0, |i| i.use_skill);
-    if skill_id != 0 && env.held_back(skill_id, flight) {
-        return;
+    if skill_id != 0 {
+        if let Some(f) = env.held_back_refusal(skill_id, flight) {
+            failed.write(UseFailed { skill: skill_id, result: f.result, value: f.value, server: false });
+            return;
+        }
+        if env.held_back(skill_id, flight) {
+            return;
+        }
     }
     if let Some((skill, f)) = env.precheck_item(item.template_id) {
         failed.write(UseFailed { skill, result: f.result, value: f.value, server: false });
